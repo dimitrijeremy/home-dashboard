@@ -1,0 +1,17 @@
+# MediaMTX configuration for path "frontdoor"
+# Replace the RTSP source below with your camera's RTSP URL.
+# Example: rtsp://username:password@192.168.1.100:554/stream
+
+paths:
+  frontdoor:
+    source: rtsp://YOUR_RTSP_SOURCE
+    sourceOnDemand: yes
+
+rtsp:
+  address: :8554
+
+http:
+  address: :8888
+
+log:
+  level: info
