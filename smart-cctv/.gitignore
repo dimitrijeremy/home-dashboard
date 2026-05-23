@@ -1,0 +1,23 @@
+# Node
+node_modules/
+/dist
+/.vite
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Docker
+docker-compose.override.yml
+*.log
+
+# Vite envs
+.env
+.env.*.local
+
+# Misc
+.DS_Store
+coverage/
+.pytest_cache/

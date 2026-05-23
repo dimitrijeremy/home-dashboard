@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - MEDIAMTX_HOST=mediamtx
+      - MEDIAMTX_HTTP_PORT=8888
+    networks:
+      - scnet
+
+  mediamtx:
+    image: aler9/mediamtx:latest
+    ports:
+      - "8554:8554"
+      - "8888:8888"
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    command: ["mediamtx", "/mediamtx.yml"]
+    networks:
+      - scnet
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_BACKEND_URL=http://backend:5000
+    depends_on:
+      - backend
+    networks:
+      - scnet
+
+networks:
+  scnet:
+    driver: bridge
