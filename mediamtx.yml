@@ -1,17 +1,32 @@
-# MediaMTX configuration for path "frontdoor"
-# Replace the RTSP source below with your camera's RTSP URL.
-# Example: rtsp://username:password@192.168.1.100:554/stream
+logLevel: info
+readTimeout: 30s
+writeTimeout: 30s
 
+# HLS settings
+hlsSegmentDuration: 4s
+hlsSegmentMaxSize: 50MB
+hlsAllowOrigins:
+  - "*"
+hlsAlwaysRemux: yes
+
+# Architecture: mediamtx manages ffmpeg subprocesses directly via runOnInit.
+# start_stream.sh stores the DVR password — avoids mediamtx $VAR expansion issue.
+# runOnInitRestart: yes → mediamtx auto-restarts ffmpeg if it crashes.
 paths:
-  frontdoor:
-    source: rtsp://YOUR_RTSP_SOURCE
-    sourceOnDemand: yes
+  ch1:
+    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 1
+    runOnInitRestart: yes
 
-rtsp:
-  address: :8554
+  ch2:
+    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 2
+    runOnInitRestart: yes
 
-http:
-  address: :8888
+  ch3:
+    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 3
+    runOnInitRestart: yes
 
-log:
-  level: info
+  ch4:
+    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 4
+    runOnInitRestart: yes
+
+  '~^custom_[0-9a-f]+$': {}

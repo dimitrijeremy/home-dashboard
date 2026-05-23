@@ -1,33 +1,51 @@
-version: '3.8'
-
 services:
   backend:
     build: ./backend
     ports:
-      - "5000:5000"
+      - "5001:5000"
     environment:
-      - MEDIAMTX_HOST=mediamtx
-      - MEDIAMTX_HTTP_PORT=8888
+      - BASE_URL=http://localhost:8888
+      - DB_PATH=/data/cameras.db
+      - FACE_PHOTO_DIR=/data/face_photos
+      - SNAPSHOT_DIR=/data/snapshots
+      - DVR_HOST=10.10.30.2
+      - DVR_USER=dashboard
+      - DVR_PASS=d4$$hb0ard-dlt
+      # Event stream needs operator/admin privilege on Dahua NVR.
+      # Set DVR_EVENT_USER + DVR_EVENT_PASS to a higher-privilege account.
+      # If not set, falls back to DVR_USER/DVR_PASS.
+      - DVR_EVENT_USER=
+      - DVR_EVENT_PASS=
+    volumes:
+      - camera_data:/data
     networks:
       - hd-net
 
-  mediamtx:
-    image: aler9/mediamtx:latest
-    ports:
-      - "8554:8554"
-      - "8888:8888"
+  analyzer:
+    build: ./analyzer
+    environment:
+      - BACKEND_URL=http://backend:5000
+      - MTX_RTSP=rtsp://host.docker.internal:8554
+      - SNAPSHOT_DIR=/data/snapshots
+      - PROCESS_EVERY=8
+      - FACE_THRESH=0.40
+      - ZONE_CONF=0.40
+      - COOLDOWN_SECS=20
     volumes:
-      - ./mediamtx.yml:/mediamtx.yml:ro
-    command: ["mediamtx", "/mediamtx.yml"]
+      - camera_data:/data
+    depends_on:
+      - backend
     networks:
       - hd-net
+    # Analyzer is optional — comment out if you don't need AI detection
+    # To enable: docker compose up --build analyzer
+    profiles:
+      - ai
 
   frontend:
     build: ./frontend
     ports:
       - "5173:5173"
-    environment:
-      - VITE_BACKEND_URL=http://backend:5000
     depends_on:
       - backend
     networks:
@@ -36,3 +54,6 @@ services:
 networks:
   hd-net:
     driver: bridge
+
+volumes:
+  camera_data:

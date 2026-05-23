@@ -1,24 +1,964 @@
+import atexit
+import base64
+import collections
+import hashlib
+import io
+import json
 import os
-from flask import Flask, jsonify
+import re
+import shutil
+import sqlite3
+import subprocess
+import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
+import requests
+from requests.auth import HTTPDigestAuth
+from flask import Flask, Response, jsonify, request, g, stream_with_context
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-MEDIAMTX_HOST = os.getenv("MEDIAMTX_HOST", "mediamtx")
-MEDIAMTX_HTTP_PORT = os.getenv("MEDIAMTX_HTTP_PORT", "8888")
-BASE_URL = os.getenv("BASE_URL", f"http://{MEDIAMTX_HOST}:{MEDIAMTX_HTTP_PORT}")
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8888")
+DB_PATH  = os.getenv("DB_PATH", "/data/cameras.db")
+CUSTOM_STREAM_SCRIPT = os.path.join(APP_DIR, "start_custom_stream.sh")
+FACE_PHOTO_DIR = os.getenv("FACE_PHOTO_DIR", "/data/face_photos")
+SNAPSHOT_DIR   = os.getenv("SNAPSHOT_DIR",   "/data/snapshots")
+CUSTOM_STREAM_PROCS = {}
+
+# ── NVR Config ──────────────────────────────────────────────
+DVR_HOST      = os.getenv("DVR_HOST", "10.10.30.2")
+DVR_HTTP_PORT = int(os.getenv("DVR_HTTP_PORT", "80"))
+DVR_USER      = os.getenv("DVR_USER", "dashboard")
+DVR_PASS      = os.getenv("DVR_PASS", "d4$hb0ard-dlt")
+# Separate credentials for the event stream (needs operator/admin on Dahua).
+# Falls back to DVR_USER/DVR_PASS if not configured.
+DVR_EVENT_USER = os.getenv("DVR_EVENT_USER") or DVR_USER
+DVR_EVENT_PASS = os.getenv("DVR_EVENT_PASS") or DVR_PASS
+
+_nvr_events = collections.deque(maxlen=30)
+_nvr_status = {"connected": False, "error": None, "last_event": None}
+_nvr_lock   = threading.Lock()
+_nvr_cond   = threading.Condition(_nvr_lock)
+_nvr_revision = 0
+_camera_write_lock = threading.Lock()
+
+
+def _nvr_bump_locked():
+    global _nvr_revision
+    _nvr_revision += 1
+    _nvr_cond.notify_all()
+
+
+def _nvr_snapshot_locked():
+    return {
+        "status": dict(_nvr_status),
+        "events": list(_nvr_events),
+        "revision": _nvr_revision,
+    }
+
+# ── DB helpers ──────────────────────────────────────────────
+
+def get_db():
+    if "db" not in g:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        g.db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc):
+    db = g.pop("db", None)
+    if db: db.close()
+
+
+def ensure_camera_columns(con):
+    existing = {row[1] for row in con.execute("PRAGMA table_info(cameras)")}
+    if "rtsp_url" not in existing:
+        con.execute("ALTER TABLE cameras ADD COLUMN rtsp_url TEXT")
+    if "channel" not in existing:
+        con.execute("ALTER TABLE cameras ADD COLUMN channel INTEGER")
+
+
+def ensure_detection_columns(con):
+    existing = {row[1] for row in con.execute("PRAGMA table_info(detection_events)")}
+    if "alarm_triggered" not in existing:
+        con.execute("ALTER TABLE detection_events ADD COLUMN alarm_triggered INTEGER NOT NULL DEFAULT 0")
+
+
+def build_rtsp_source(rtsp_url, channel):
+    base = rtsp_url.strip()
+    if not base:
+        raise ValueError("rtsp_url is required")
+
+    if "://" not in base:
+        base = f"rtsps://{base}"
+
+    channel_str = str(int(channel))
+    if "{channel}" in base:
+        return base.replace("{channel}", channel_str)
+
+    parts = urlsplit(base)
+    if parts.scheme not in {"rtsp", "rtsps", "rtsp+http", "rtsps+http", "rtsp+ws", "rtsps+ws"}:
+        raise ValueError("unsupported rtsp_url scheme")
+
+    pairs = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "channel"]
+    pairs.insert(0, ("channel", channel_str))
+
+    return urlunsplit(parts._replace(query=urlencode(pairs)))
+
+
+def extract_custom_path_name(stream_url):
+    path = urlsplit(stream_url).path.strip("/")
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[0].startswith("custom_"):
+        return parts[0]
+    return None
+
+
+def stop_custom_stream(path_name):
+    entry = CUSTOM_STREAM_PROCS.pop(path_name, None)
+    if not entry:
+        return
+
+    proc = entry["proc"]
+    log_handle = entry["log"]
+    if proc.poll() is None:
+        proc.terminate()
+    log_handle.close()
+
+
+def launch_custom_stream(path_name, rtsp_url, channel):
+    existing = CUSTOM_STREAM_PROCS.get(path_name)
+    if existing and existing["proc"].poll() is None:
+        return
+
+    stop_custom_stream(path_name)
+    source_url = build_rtsp_source(rtsp_url, channel)
+    log_handle = open(f"/tmp/{path_name}.log", "ab")
+    proc = subprocess.Popen(
+        [CUSTOM_STREAM_SCRIPT, source_url, path_name],
+        cwd=APP_DIR,
+        stdout=log_handle,
+        stderr=log_handle,
+        start_new_session=True,
+    )
+    CUSTOM_STREAM_PROCS[path_name] = {"proc": proc, "log": log_handle}
+
+
+def restore_custom_streams(con):
+    rows = con.execute(
+        "SELECT stream_url, rtsp_url, channel FROM cameras WHERE builtin=0 AND rtsp_url IS NOT NULL AND rtsp_url != '' AND channel IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        path_name = extract_custom_path_name(row[0])
+        if not path_name:
+            continue
+        try:
+            launch_custom_stream(path_name, row[1], row[2])
+        except Exception as e:
+            print(f"[STREAM] restore failed for {path_name}: {e}", flush=True)
+
+
+@atexit.register
+def stop_all_custom_streams():
+    for path_name in list(CUSTOM_STREAM_PROCS.keys()):
+        stop_custom_stream(path_name)
+
+def init_db():
+    """Create table and seed default 4 channels if DB is new."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS cameras (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT    NOT NULL,
+            stream_url TEXT    NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            builtin    INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    ensure_camera_columns(con)
+    # New tables for AI detection feature
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS zones (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            camera_id   INTEGER NOT NULL,
+            name        TEXT    NOT NULL,
+            points_json TEXT    NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS known_faces (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT    NOT NULL,
+            photo_path TEXT,
+            created_at TEXT    NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS detection_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              TEXT    NOT NULL,
+            channel_id      TEXT    NOT NULL,
+            camera_name     TEXT    NOT NULL DEFAULT '',
+            event_type      TEXT    NOT NULL,
+            zone_name       TEXT,
+            person_name     TEXT,
+            confidence      REAL,
+            extra_json      TEXT,
+            alarm_triggered INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    # Seed default settings
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('mode', 'home')")
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_stream_user', ?)" , (DVR_USER,))
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_stream_pass', ?)" , (DVR_PASS,))
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_user', ?)" , (DVR_EVENT_USER,))
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_pass', ?)" , (DVR_EVENT_PASS,))
+    ensure_detection_columns(con)
+    # Only seed once (when table is empty)
+    if con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] == 0:
+        defaults = [
+            ("Camera 1", f"{BASE_URL}/ch1/index.m3u8", 1, 1, None, None),
+            ("Camera 2", f"{BASE_URL}/ch2/index.m3u8", 2, 1, None, None),
+            ("Camera 3", f"{BASE_URL}/ch3/index.m3u8", 3, 1, None, None),
+            ("Camera 4", f"{BASE_URL}/ch4/index.m3u8", 4, 1, None, None),
+        ]
+        con.executemany(
+            "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel) VALUES (?,?,?,?,?,?)",
+            defaults
+        )
+    con.commit()
+    restore_custom_streams(con)
+    con.close()
+
+# ── Routes ──────────────────────────────────────────────────
 
 @app.route('/api/cameras', methods=['GET'])
 def get_cameras():
-    data = [
-        {
-            "id": 1,
-            "name": "Front Door",
-            "stream_url": f"{BASE_URL}/frontdoor/index.m3u8"
-        }
-    ]
-    return jsonify(data)
+    rows = get_db().execute(
+        "SELECT id, name, stream_url, builtin FROM cameras ORDER BY sort_order, id"
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/cameras', methods=['POST'])
+def add_camera():
+    body = request.get_json(silent=True) or {}
+    name = (body.get('name') or '').strip()
+
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+
+    stream_url = (body.get('stream_url') or '').strip()
+    rtsp_url = (body.get('rtsp_url') or '').strip()
+    channel_raw = str(body.get('channel') or '').strip()
+
+    custom_rtsp_url = None
+    custom_channel = None
+    path_name = None
+
+    if rtsp_url or channel_raw:
+        if not rtsp_url:
+            return jsonify({'error': 'rtsp_url is required'}), 400
+        if not channel_raw.isdigit() or int(channel_raw) <= 0:
+            return jsonify({'error': 'channel must be a positive integer'}), 400
+
+        custom_rtsp_url = rtsp_url
+        custom_channel = int(channel_raw)
+        path_name = f"custom_{uuid4().hex[:10]}"
+        stream_url = f"{BASE_URL}/{path_name}/index.m3u8"
+    else:
+        if not stream_url.startswith('http'):
+            return jsonify({'error': 'stream_url must start with http'}), 400
+
+    db = get_db()
+    with _camera_write_lock:
+        if custom_rtsp_url and custom_channel:
+            existing = db.execute(
+                """SELECT id, name, stream_url, builtin FROM cameras
+                   WHERE builtin=0 AND name=? AND rtsp_url=? AND channel=?
+                   ORDER BY id DESC LIMIT 1""",
+                (name, custom_rtsp_url, custom_channel)
+            ).fetchone()
+            if existing:
+                return jsonify(dict(existing)), 200
+
+        max_order = db.execute("SELECT COALESCE(MAX(sort_order),0) FROM cameras").fetchone()[0]
+        cur = db.execute(
+            "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel) VALUES (?,?,?,0,?,?)",
+            (name, stream_url, max_order + 1, custom_rtsp_url, custom_channel)
+        )
+        db.commit()
+        camera_id = cur.lastrowid
+
+    stream_warning = None
+    if path_name and custom_rtsp_url and custom_channel:
+        try:
+            launch_custom_stream(path_name, custom_rtsp_url, custom_channel)
+        except Exception as e:
+            stream_warning = str(e)[:160]
+            print(f"[STREAM] launch failed for {path_name}: {e}", flush=True)
+
+    payload = {'id': camera_id, 'name': name, 'stream_url': stream_url, 'builtin': 0}
+    if stream_warning:
+        payload['stream_warning'] = stream_warning
+    return jsonify(payload), 201
+
+
+@app.route('/api/cameras/<int:cam_id>', methods=['DELETE'])
+def delete_camera(cam_id):
+    db = get_db()
+    row = db.execute("SELECT builtin, stream_url FROM cameras WHERE id=?", (cam_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    if row['builtin']:
+        return jsonify({'error': 'cannot delete built-in camera'}), 403
+    path_name = extract_custom_path_name(row['stream_url'])
+    if path_name:
+        stop_custom_stream(path_name)
+    db.execute("DELETE FROM cameras WHERE id=?", (cam_id,))
+    db.commit()
+    return '', 204
+
+
+@app.route('/api/cameras/<int:cam_id>', methods=['PATCH'])
+def update_camera(cam_id):
+    db = get_db()
+    row = db.execute("SELECT id FROM cameras WHERE id=?", (cam_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+
+    body = request.get_json(silent=True) or {}
+    fields, vals = [], []
+    if 'name' in body:
+        name = body['name'].strip()
+        if not name:
+            return jsonify({'error': 'name cannot be empty'}), 400
+        fields.append('name=?'); vals.append(name)
+    if 'stream_url' in body:
+        url = body['stream_url'].strip()
+        if not url.startswith('http'):
+            return jsonify({'error': 'stream_url must start with http'}), 400
+        fields.append('stream_url=?'); vals.append(url)
+
+    if fields:
+        vals.append(cam_id)
+        db.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", vals)
+        db.commit()
+
+    updated = db.execute("SELECT id, name, stream_url, builtin FROM cameras WHERE id=?", (cam_id,)).fetchone()
+    return jsonify(dict(updated))
+
+
+@app.route('/api/stream-status', methods=['GET'])
+def stream_status():
+    rows = get_db().execute(
+        "SELECT id, name, stream_url, builtin FROM cameras ORDER BY sort_order, id"
+    ).fetchall()
+
+    def status_check_url(stream_url):
+        parts = urlsplit(stream_url)
+        if parts.hostname in {"localhost", "127.0.0.1"}:
+            port = f":{parts.port}" if parts.port else ""
+            return urlunsplit(parts._replace(netloc=f"host.docker.internal{port}"))
+        return stream_url
+
+    def check(row):
+        try:
+            res = urllib.request.urlopen(status_check_url(row['stream_url']), timeout=3)
+            online = res.status == 200
+        except Exception:
+            online = False
+        return {'id': row['id'], 'name': row['name'], 'online': online, 'builtin': bool(row['builtin'])}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(check, [dict(r) for r in rows]))
+
+    return jsonify(results)
+
+
+@app.route('/api/stream-restart/<int:cam_id>', methods=['POST'])
+def restart_stream(cam_id):
+    row = get_db().execute(
+        "SELECT id, builtin, stream_url, rtsp_url, channel FROM cameras WHERE id=?", (cam_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+
+    if row['builtin']:
+        # Kill ffmpeg pushing to this path — mediamtx runOnInitRestart respawns it
+        path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]  # e.g. "ch1"
+        _restart_host_rtsp_publisher(path_seg)
+    else:
+        path_name = extract_custom_path_name(row['stream_url'])
+        if path_name and row['rtsp_url'] and row['channel']:
+            stop_custom_stream(path_name)
+            launch_custom_stream(path_name, row['rtsp_url'], row['channel'])
+
+    return jsonify({'ok': True})
+
+
+@app.route('/api/stream-restart-all', methods=['POST'])
+def restart_all_streams():
+    rows = get_db().execute(
+        "SELECT id, builtin, stream_url, rtsp_url, channel FROM cameras"
+    ).fetchall()
+    for row in rows:
+        if row['builtin']:
+            path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]
+            _restart_host_rtsp_publisher(path_seg)
+        else:
+            path_name = extract_custom_path_name(row['stream_url'])
+            if path_name and row['rtsp_url'] and row['channel']:
+                stop_custom_stream(path_name)
+                launch_custom_stream(path_name, row['rtsp_url'], row['channel'])
+    return jsonify({'ok': True})
+
+
+# ── NVR Credential helpers ──────────────────────────────────────────────────
+
+def _db_setting(key, fallback=''):
+    """Read a single setting value from DB; returns fallback if not found."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        con.close()
+        return row[0] if row else fallback
+    except Exception:
+        return fallback
+
+
+def _set_db_setting(key, value):
+    """Write (upsert) a setting to DB."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+    con.commit()
+    con.close()
+
+
+def _get_nvr_event_creds():
+    """Return (user, pass) for NVR event stream — DB first, then env fallback."""
+    user   = _db_setting('nvr_event_user') or DVR_EVENT_USER
+    passwd = _db_setting('nvr_event_pass') or DVR_EVENT_PASS
+    return user, passwd
+
+
+def _get_nvr_stream_creds():
+    """Return (user, pass) used by MediaMTX/ffmpeg for channel 1-4 streams."""
+    user   = _db_setting('nvr_stream_user') or DVR_USER
+    passwd = _db_setting('nvr_stream_pass') or DVR_PASS
+    return user, passwd
+
+
+def _restart_host_rtsp_publisher(path_seg):
+    pkill = shutil.which("pkill")
+    if not pkill:
+        return False
+    subprocess.run([pkill, '-f', f'rtsp://localhost:8554/{path_seg}'], capture_output=True)
+    return True
+
+
+# ── NVR Event Stream ────────────────────────────────────────────────────────
+
+# Exponential backoff state for 403 (account lock / permission denied)
+_nvr_backoff   = 120   # current wait seconds; resets on success
+_NVR_BACKOFF_MAX = 900  # Dahua RmLock ≤ 850 s; 15 min ensures unlock
+
+
+def _nvr_event_worker():
+    """Background daemon thread: subscribe to Dahua NVR event stream."""
+    global _nvr_backoff
+    if not DVR_HOST:
+        return
+    # Initial startup delay: wait before first attempt to avoid hammering NVR
+    # immediately on container start (which can trigger account lockout).
+    time.sleep(60)
+    url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5"
+    while True:
+        # Re-read credentials from DB each reconnect so config changes take effect
+        event_user, event_pass = _get_nvr_event_creds()
+        auth = HTTPDigestAuth(event_user, event_pass)
+        try:
+            with requests.get(url, auth=auth, stream=True,
+                              timeout=(15, 60)) as resp:
+
+                if resp.status_code == 401:
+                    # Credentials wrong
+                    body = resp.text[:200]
+                    print(f"[NVR] 401 Unauthorized: {body}", flush=True)
+                    with _nvr_lock:
+                        _nvr_status["connected"] = False
+                        _nvr_status["error"] = "401 Unauthorized – periksa DVR_USER/DVR_PASS"
+                        _nvr_bump_locked()
+                    time.sleep(_nvr_backoff)
+                    _nvr_backoff = min(_nvr_backoff * 2, _NVR_BACKOFF_MAX)
+                    continue
+
+                if resp.status_code == 403:
+                    body = resp.text[:300].strip()
+                    # Parse RmLock from Dahua JSON to get exact lock duration
+                    rm_lock = 0
+                    try:
+                        data = json.loads(body)
+                        rm_lock = int(data.get("RmLock", 0))
+                    except Exception:
+                        pass
+                    wait = max(rm_lock + 30, _nvr_backoff) if rm_lock > 0 else _nvr_backoff
+                    locked = rm_lock > 0 or "Lock" in body
+                    print(f"[NVR] 403 – RmLock={rm_lock}s, backoff {wait}s", flush=True)
+                    with _nvr_lock:
+                        _nvr_status["connected"] = False
+                        _nvr_status["error"] = (
+                            f"403 Akun terkunci, tunggu {wait}s (RmLock={rm_lock}s)"
+                            if locked else
+                            f"403 Akses ditolak (periksa hak akses user 'dashboard')"
+                        )
+                        _nvr_bump_locked()
+                    time.sleep(wait)
+                    _nvr_backoff = min(_nvr_backoff * 2, _NVR_BACKOFF_MAX)
+                    continue
+
+                if resp.status_code != 200:
+                    print(f"[NVR] HTTP {resp.status_code}", flush=True)
+                    with _nvr_lock:
+                        _nvr_status["connected"] = False
+                        _nvr_status["error"] = f"HTTP {resp.status_code}"
+                        _nvr_bump_locked()
+                    time.sleep(15)
+                    continue
+
+                # Connected successfully – reset backoff
+                _nvr_backoff = 120
+                with _nvr_lock:
+                    _nvr_status["connected"] = True
+                    _nvr_status["error"] = None
+                    _nvr_bump_locked()
+                print("[NVR] Event stream connected", flush=True)
+
+                buf = b""
+                for chunk in resp.iter_content(chunk_size=2048):
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\r\n\r\n" in buf:
+                        sep = buf.find(b"\r\n\r\n")
+                        buf = buf[sep + 4:]
+                        boundary = buf.find(b"--myboundary")
+                        if boundary == -1:
+                            break
+                        payload = buf[:boundary].decode("utf-8", errors="replace").strip()
+                        buf = buf[boundary:]
+                        if not payload or "Code=" not in payload:
+                            continue
+                        ev_code = ev_action = ""
+                        ev_index = 0
+                        for part in payload.split(";"):
+                            part = part.strip()
+                            if part.startswith("Code="):
+                                ev_code = part[5:].strip()
+                            elif part.startswith("action="):
+                                ev_action = part[7:].strip()
+                            elif part.startswith("index="):
+                                try:
+                                    ev_index = int(part[6:].strip())
+                                except ValueError:
+                                    pass
+                        if not ev_code or not ev_action:
+                            continue
+                        event = {
+                            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "code": ev_code,
+                            "action": ev_action,
+                            "index": ev_index,
+                        }
+                        with _nvr_lock:
+                            _nvr_events.appendleft(event)
+                            _nvr_status["last_event"] = event["ts"]
+                            _nvr_bump_locked()
+        except Exception as e:
+            with _nvr_lock:
+                _nvr_status["connected"] = False
+                _nvr_status["error"] = str(e)[:120]
+                _nvr_bump_locked()
+        time.sleep(5)
+
+
+@app.route('/api/nvr-events', methods=['GET'])
+def get_nvr_events():
+    with _nvr_lock:
+        return jsonify(_nvr_snapshot_locked())
+
+
+@app.route('/api/nvr-events/stream', methods=['GET'])
+def stream_nvr_events():
+    def generate():
+        with _nvr_cond:
+            last_revision = _nvr_revision
+            initial_payload = json.dumps(_nvr_snapshot_locked())
+        yield f"data: {initial_payload}\n\n"
+
+        while True:
+            with _nvr_cond:
+                _nvr_cond.wait(timeout=25)
+                if _nvr_revision == last_revision:
+                    payload = None
+                else:
+                    last_revision = _nvr_revision
+                    payload = json.dumps(_nvr_snapshot_locked())
+            if payload is None:
+                yield ": keepalive\n\n"
+                continue
+            yield f"data: {payload}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
+@app.route('/api/nvr-config', methods=['GET'])
+def get_nvr_config():
+    stream_user, stream_pass = _get_nvr_stream_creds()
+    event_user = _db_setting('nvr_event_user') or DVR_EVENT_USER
+    event_pass = _db_setting('nvr_event_pass') or DVR_EVENT_PASS
+    return jsonify({
+        'host': DVR_HOST,
+        'http_port': DVR_HTTP_PORT,
+        'stream_user': stream_user,
+        'stream_pass': stream_pass,
+        'event_user': event_user,
+        'event_pass': event_pass,
+    })
+
+
+@app.route('/api/nvr-config', methods=['POST'])
+def set_nvr_config():
+    body = request.get_json(silent=True) or {}
+    updated = {}
+    if 'stream_user' in body:
+        val = (body['stream_user'] or '').strip()
+        if not val:
+            return jsonify({'error': 'stream_user cannot be empty'}), 400
+        _set_db_setting('nvr_stream_user', val)
+        updated['stream_user'] = val
+    if 'stream_pass' in body:
+        val = (body['stream_pass'] or '').strip()
+        if not val:
+            return jsonify({'error': 'stream_pass cannot be empty'}), 400
+        _set_db_setting('nvr_stream_pass', val)
+        updated['stream_pass'] = val
+    if 'event_user' in body:
+        val = (body['event_user'] or '').strip()
+        if not val:
+            return jsonify({'error': 'event_user cannot be empty'}), 400
+        _set_db_setting('nvr_event_user', val)
+        updated['event_user'] = val
+    if 'event_pass' in body:
+        val = (body['event_pass'] or '').strip()
+        if not val:
+            return jsonify({'error': 'event_pass cannot be empty'}), 400
+        _set_db_setting('nvr_event_pass', val)
+        updated['event_pass'] = val
+    return jsonify({'ok': True, 'updated': list(updated.keys())})
+
+
+# ── Zones ───────────────────────────────────────────────────────────────────
+
+@app.route('/api/zones', methods=['GET'])
+def get_zones():
+    rows = get_db().execute(
+        "SELECT id, camera_id, name, points_json, enabled FROM zones ORDER BY camera_id, id"
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/zones', methods=['POST'])
+def add_zone():
+    body = request.get_json(silent=True) or {}
+    camera_id = body.get('camera_id')
+    name = (body.get('name') or '').strip()
+    points = body.get('points')  # [[x_norm, y_norm], ...]
+
+    if not camera_id or not name:
+        return jsonify({'error': 'camera_id and name required'}), 400
+    if not isinstance(points, list) or len(points) < 3:
+        return jsonify({'error': 'points must be an array of at least 3 [x,y] pairs'}), 400
+
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO zones (camera_id, name, points_json, enabled) VALUES (?,?,?,1)",
+        (camera_id, name, json.dumps(points))
+    )
+    db.commit()
+    return jsonify({'id': cur.lastrowid, 'camera_id': camera_id, 'name': name,
+                    'points_json': json.dumps(points), 'enabled': 1}), 201
+
+
+@app.route('/api/zones/<int:zone_id>', methods=['DELETE'])
+def delete_zone(zone_id):
+    db = get_db()
+    if not db.execute("SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        return jsonify({'error': 'not found'}), 404
+    db.execute("DELETE FROM zones WHERE id=?", (zone_id,))
+    db.commit()
+    return '', 204
+
+
+@app.route('/api/zones/<int:zone_id>', methods=['PATCH'])
+def update_zone(zone_id):
+    db = get_db()
+    if not db.execute("SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    fields, vals = [], []
+    if 'enabled' in body:
+        fields.append('enabled=?')
+        vals.append(1 if body['enabled'] else 0)
+    if 'name' in body:
+        fields.append('name=?')
+        vals.append(body['name'].strip())
+    if fields:
+        vals.append(zone_id)
+        db.execute(f"UPDATE zones SET {', '.join(fields)} WHERE id=?", vals)
+        db.commit()
+    return jsonify(dict(db.execute("SELECT * FROM zones WHERE id=?", (zone_id,)).fetchone()))
+
+
+# ── Known Faces ──────────────────────────────────────────────────────────────
+
+@app.route('/api/faces', methods=['GET'])
+def get_faces():
+    include_photo = request.args.get('include_photo') == '1'
+    rows = get_db().execute(
+        "SELECT id, name, photo_path, created_at FROM known_faces ORDER BY id"
+    ).fetchall()
+    result = []
+    for r in rows:
+        d = {'id': r['id'], 'name': r['name'], 'created_at': r['created_at']}
+        if include_photo and r['photo_path'] and os.path.exists(r['photo_path']):
+            with open(r['photo_path'], 'rb') as f:
+                d['photo_b64'] = base64.b64encode(f.read()).decode()
+        result.append(d)
+    return jsonify(result)
+
+
+@app.route('/api/faces', methods=['POST'])
+def add_face():
+    name = (request.form.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+    photo = request.files.get('photo')
+    if not photo:
+        return jsonify({'error': 'photo is required'}), 400
+
+    photo_data = photo.read()
+    # Validate it's a readable image
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(photo_data))
+        img.convert("RGB")  # forces full decode; raises on corrupt files
+    except Exception:
+        return jsonify({'error': 'invalid image file'}), 400
+
+    os.makedirs(FACE_PHOTO_DIR, exist_ok=True)
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO known_faces (name, photo_path, created_at) VALUES (?,?,?)",
+        (name, None, datetime.utcnow().isoformat())
+    )
+    face_id = cur.lastrowid
+    db.commit()
+
+    photo_path = os.path.join(FACE_PHOTO_DIR, f"{face_id}.jpg")
+    # Save as JPEG regardless of input format
+    from PIL import Image
+    img = Image.open(io.BytesIO(photo_data)).convert("RGB")
+    img.save(photo_path, "JPEG", quality=90)
+
+    db.execute("UPDATE known_faces SET photo_path=? WHERE id=?", (photo_path, face_id))
+    db.commit()
+    return jsonify({'id': face_id, 'name': name}), 201
+
+
+@app.route('/api/faces/<int:face_id>', methods=['DELETE'])
+def delete_face(face_id):
+    db = get_db()
+    row = db.execute("SELECT photo_path FROM known_faces WHERE id=?", (face_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    if row['photo_path'] and os.path.exists(row['photo_path']):
+        os.remove(row['photo_path'])
+    db.execute("DELETE FROM known_faces WHERE id=?", (face_id,))
+    db.commit()
+    return '', 204
+
+
+@app.route('/api/faces/<int:face_id>/photo')
+def get_face_photo(face_id):
+    row = get_db().execute("SELECT photo_path FROM known_faces WHERE id=?", (face_id,)).fetchone()
+    if not row or not row['photo_path'] or not os.path.exists(row['photo_path']):
+        return jsonify({'error': 'photo not found'}), 404
+    with open(row['photo_path'], 'rb') as f:
+        data = f.read()
+    return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache'}
+
+
+# ── Home / Away Mode ─────────────────────────────────────────────────────────
+
+ALARM_EVENT_TYPES = {'ZoneIntrusion', 'UnknownFace', 'FaceRecognized'}
+
+
+def _get_current_mode(db):
+    row = db.execute("SELECT value FROM settings WHERE key='mode'").fetchone()
+    return row['value'] if row else 'home'
+
+
+def _trigger_alarm(event_body):
+    """Called when mode=away and a human detection event arrives.
+    Extend this function to send webhooks, trigger a siren, etc.
+    """
+    print(
+        f"[ALARM] TRIGGERED – event={event_body.get('event_type')}"
+        f", ch={event_body.get('channel_id')}"
+        f", person={event_body.get('person_name')}"
+        f", zone={event_body.get('zone_name')}",
+        flush=True,
+    )
+    # TODO: send webhook / push notification / siren
+
+
+@app.route('/api/mode', methods=['GET'])
+def get_mode():
+    mode = _get_current_mode(get_db())
+    return jsonify({'mode': mode})
+
+
+@app.route('/api/mode', methods=['POST'])
+def update_mode():
+    body = request.get_json(silent=True) or {}
+    mode = body.get('mode', 'home')
+    if mode not in ('home', 'away'):
+        return jsonify({'error': 'mode must be \'home\' or \'away\''}), 400
+    db = get_db()
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('mode', ?)", (mode,))
+    db.commit()
+    print(f"[MODE] Changed to '{mode}'", flush=True)
+    return jsonify({'mode': mode})
+
+
+# ── Analyzer Events (intake + read) ──────────────────────────────────────────
+
+@app.route('/api/analyzer-event', methods=['POST'])
+def receive_analyzer_event():
+    body = request.get_json(silent=True) or {}
+    ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    db = get_db()
+
+    # Check alarm condition: mode=away + human detection event
+    current_mode = _get_current_mode(db)
+    event_type   = body.get('event_type', 'Unknown')
+    alarm        = 1 if (current_mode == 'away' and event_type in ALARM_EVENT_TYPES) else 0
+
+    db.execute(
+        """INSERT INTO detection_events
+           (ts, channel_id, camera_name, event_type, zone_name, person_name, confidence, extra_json, alarm_triggered)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            ts,
+            body.get('channel_id', ''),
+            body.get('camera_name', ''),
+            event_type,
+            body.get('zone_name'),
+            body.get('person_name'),
+            body.get('confidence'),
+            body.get('extra_json'),
+            alarm,
+        )
+    )
+    db.commit()
+
+    if alarm:
+        _trigger_alarm(body)
+
+    # Also push into in-memory NVR event deque so NVREventLog picks it up live
+    event = {
+        'ts':             ts,
+        'code':           event_type,
+        'action':         'Start',
+        'index':          0,
+        'zone_name':      body.get('zone_name'),
+        'person':         body.get('person_name'),
+        'channel':        body.get('channel_id', ''),
+        'alarm':          bool(alarm),
+    }
+    with _nvr_lock:
+        _nvr_events.appendleft(event)
+        _nvr_status['last_event'] = ts
+        _nvr_bump_locked()
+    return jsonify({'ok': True, 'alarm_triggered': bool(alarm)})
+
+
+@app.route('/api/detection-events', methods=['GET'])
+def get_detection_events():
+    limit  = min(int(request.args.get('limit',  50)), 200)
+    offset = int(request.args.get('offset', 0))
+    rows = get_db().execute(
+        """SELECT id, ts, channel_id, camera_name, event_type, zone_name,
+                  person_name, confidence
+           FROM detection_events ORDER BY id DESC LIMIT ? OFFSET ?""",
+        (limit, offset)
+    ).fetchall()
+    total = get_db().execute("SELECT COUNT(*) FROM detection_events").fetchone()[0]
+    return jsonify({'total': total, 'events': [dict(r) for r in rows]})
+
+
+@app.route('/api/detection-events', methods=['DELETE'])
+def clear_detection_events():
+    get_db().execute("DELETE FROM detection_events")
+    get_db().commit()
+    return jsonify({'ok': True})
+
+
+# ── Camera Snapshot ──────────────────────────────────────────────────────────
+
+@app.route('/api/cameras/<int:cam_id>/snapshot')
+def camera_snapshot(cam_id):
+    row = get_db().execute("SELECT stream_url FROM cameras WHERE id=?", (cam_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    from urllib.parse import urlsplit
+    path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]
+    snap_path = os.path.join(SNAPSHOT_DIR, f"{path_seg}.jpg")
+    if not os.path.exists(snap_path):
+        return jsonify({'error': 'snapshot not yet available; start the analyzer service'}), 404
+    with open(snap_path, 'rb') as f:
+        data = f.read()
+    return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache'}
+
+
+_nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")
+_nvr_thread.start()
+
+init_db()
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
