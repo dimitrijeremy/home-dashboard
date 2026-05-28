@@ -1,9 +1,46 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { fetchCameras, addCamera, deleteCamera, fetchStreamStatus, restartStream, restartAllStreams, fetchMode, postMode } from '../services/api'
 import CCTVPlayer from '../features/cctv/CCTVPlayer'
 import AddChannelModal from '../features/cctv/AddChannelModal'
 import SmartControls from '../features/smarthome/SmartControls'
 import WeatherWidget from '../features/weather/WeatherWidget'
+
+// ── Perimeter Alert Toasts ─────────────────────────────────────────────────
+const ALERT_CODES = new Set(['ZoneIntrusion', 'SmartMotionHuman', 'AlarmLocal', 'VideoMotion'])
+const ALERT_TTL = 10000 // ms
+
+function AlertToasts({ alerts, onDismiss }) {
+  if (!alerts.length) return null
+  return (
+    <div style={{
+      position: 'fixed', top: 72, right: 16, zIndex: 9999,
+      display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 340,
+    }}>
+      {alerts.map(a => (
+        <div key={a.id} style={{
+          background: 'rgba(239,68,68,.92)', color: '#fff',
+          borderRadius: 'var(--r-sm)', padding: '10px 14px',
+          boxShadow: '0 4px 20px rgba(0,0,0,.4)',
+          display: 'flex', gap: 10, alignItems: 'flex-start',
+          backdropFilter: 'blur(4px)',
+          animation: 'slideInRight .25s ease',
+        }}>
+          <span style={{ fontSize: 18 }}>🚨</span>
+          <div style={{ flex: 1, lineHeight: 1.4 }}>
+            <div style={{ fontWeight: 700, fontSize: '.88rem' }}>{a.code}</div>
+            <div style={{ fontSize: '.8rem', opacity: .9 }}>
+              {a.channel && `Ch${a.channel} · `}{a.time}
+            </div>
+          </div>
+          <button
+            onClick={() => onDismiss(a.id)}
+            style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: 14, padding: 0 }}
+          >✕</button>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 function Clock() {
   const [time, setTime] = useState(new Date())
@@ -181,6 +218,44 @@ export default function Dashboard({ onConfig }) {
   const [viewMode,    setViewMode]    = useState('grid2')
   const [mode,        setMode]        = useState('home')
   const [modeLoading, setModeLoading] = useState(false)
+  const [alerts,      setAlerts]      = useState([])
+  const alertTimers = useRef({})
+
+  const dismissAlert = (id) => {
+    clearTimeout(alertTimers.current[id])
+    delete alertTimers.current[id]
+    setAlerts(prev => prev.filter(a => a.id !== id))
+  }
+
+  // Subscribe to NVR event SSE for real-time perimeter alerts
+  useEffect(() => {
+    let es
+    const connect = () => {
+      es = new EventSource('/api/nvr-events/stream')
+      es.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data)
+          if (ALERT_CODES.has(event.code) && event.action === 'Start') {
+            const id = `${Date.now()}-${Math.random()}`
+            const alert = {
+              id,
+              code: event.code,
+              channel: event.channel,
+              time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            }
+            setAlerts(prev => [alert, ...prev].slice(0, 5))
+            alertTimers.current[id] = setTimeout(() => dismissAlert(id), ALERT_TTL)
+          }
+        } catch { /* ignore malformed */ }
+      }
+    }
+    connect()
+    return () => {
+      es?.close()
+      Object.values(alertTimers.current).forEach(clearTimeout)
+    }
+  }, [])
+
 
   const reload = () => fetchCameras().then(setCams).catch(e => setError(e.message))
 
@@ -314,6 +389,7 @@ export default function Dashboard({ onConfig }) {
       {showModal && (
         <AddChannelModal onAdd={handleAdd} onClose={() => setShowModal(false)} />
       )}
+      <AlertToasts alerts={alerts} onDismiss={dismissAlert} />
     </div>
   )
 }

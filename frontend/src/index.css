@@ -135,6 +135,7 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .stream-status-wrap{position:relative}
 .stream-status-panel{position:absolute;right:0;top:calc(100% + 6px);z-index:200;min-width:300px;background:var(--surface);border:1px solid var(--border2);border-radius:var(--r);padding:10px 14px;box-shadow:0 8px 32px rgba(0,0,0,.5);animation:fadeIn .15s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+@keyframes slideInRight{from{opacity:0;transform:translateX(60px)}to{opacity:1;transform:translateX(0)}}
 .stream-status-row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border)}
 .stream-status-row:last-of-type{border-bottom:none}
 .stream-status-name{flex:1;font-size:.82rem;color:var(--text-dim)}
@@ -211,10 +212,13 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
    ═══════════════════════════════════════════════ */
 .zone-editor{display:flex;flex-direction:column;gap:14px}
 .zone-canvas-wrap{position:relative;background:#000;border-radius:var(--r);overflow:hidden;border:1px solid var(--border);line-height:0}
+.zone-canvas-wrap.is-placeholder{display:flex;align-items:center;justify-content:center;min-height:240px;padding:20px;line-height:1.4}
 .zone-snap-img{width:100%;display:block;max-height:480px;object-fit:contain}
 .zone-canvas{position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair}
 .zone-canvas.readonly{cursor:default}
 .zone-snap-loading{padding:48px;text-align:center;color:var(--text-muted);font-size:.82rem}
+.zone-snap-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;max-width:320px;text-align:center;color:var(--text-muted);font-size:.82rem;line-height:1.5}
+.zone-snap-placeholder .btn-icon{margin-top:0!important}
 .zone-draft-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--surface);border-radius:var(--r-sm);border:1px solid var(--border)}
 .zone-draft-bar input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:var(--r-sm);font-size:.82rem}
 .zone-draft-bar input:focus{outline:none;border-color:var(--accent)}
@@ -336,3 +340,20 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .nvr-msg.err{background:rgba(239,68,68,.1);color:#ef4444;border:1px solid rgba(239,68,68,.3)}
 .nvr-cred-note{margin-top:16px;padding:8px 12px;background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:var(--r-sm);font-size:.78rem;color:var(--text-muted)}
 .nvr-cred-note code{background:rgba(255,255,255,.08);padding:1px 4px;border-radius:3px;font-size:.75rem}
+.nvr-info-block{display:flex;flex-direction:column;gap:12px}
+.nvr-info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.nvr-info-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px;display:flex;flex-direction:column;gap:10px}
+.nvr-info-title{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted)}
+.nvr-info-kv{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:.8rem}
+.nvr-info-kv span{color:var(--text-muted)}
+.nvr-info-kv strong{font-size:.82rem;text-align:right;word-break:break-word}
+.nvr-info-empty{padding:24px;text-align:center;color:var(--text-muted);font-size:.82rem;background:var(--surface);border-radius:var(--r);border:1px dashed var(--border)}
+.nvr-disk-list{display:flex;flex-direction:column;gap:8px}
+.nvr-disk-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:10px 12px;background:rgba(255,255,255,.03);border-radius:var(--r-sm);border:1px solid var(--border)}
+.nvr-disk-row div{display:flex;flex-direction:column;gap:2px;font-size:.78rem}
+.nvr-disk-row span{color:var(--text-muted)}
+.nvr-channel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.nvr-channel-chip{display:flex;flex-direction:column;gap:4px;padding:10px 12px;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:var(--r-sm);font-size:.78rem}
+.nvr-channel-chip span{color:var(--text-muted)}
+.nvr-ok{color:#22c55e}
+.nvr-bad{color:#ef4444}

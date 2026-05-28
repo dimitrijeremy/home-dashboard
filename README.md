@@ -9,15 +9,15 @@ Dashboard rumah dengan CCTV live, kontrol smart home, cuaca, NVR event stream, d
 ```
 Dahua NVR (RTSPS :554)
     │
-    └── ffmpeg (VideoToolbox H.264/AAC)
+    └── ffmpeg via MediaMTX runOnInit (-c:v copy, AAC)
             │
-        MediaMTX (host) ──► RTSP :8554 ──► analyzer service (AI, opsional)
+        MediaMTX container
+        ├── RTSP :8554 → analyzer service (AI, opsional)
+        └── HLS :8888 → browser / frontend
             │
-           HLS :8888
+        backend container (Flask :5001 / internal :5000)
             │
-        backend container (Flask :5001)
-            │
-        frontend container (React+Vite :5173)
+        frontend container (nginx :5173 lokal / :8088 server)
 ```
 
 ---
@@ -26,46 +26,35 @@ Dahua NVR (RTSPS :554)
 
 | Nama | Cara jalankan | Port | Keterangan |
 |------|--------------|------|------------|
-| **mediamtx** | Host binary | RTSP `8554`, HLS `8888` | Terima stream ffmpeg→RTSPS dari NVR, publikasikan ke HLS. Harus jalan di host (bukan container) karena butuh VideoToolbox. |
+| **mtx / mediamtx** | Docker Compose | RTSP `8554`, HLS `8888` | Otomatis start saat `docker compose up -d`. `runOnInit` memanggil `mtx/start_stream.sh` untuk ch1–ch4 tanpa perlu menjalankan script manual. |
 | **backend** | Docker Compose | `5001` | Flask API: kamera, zona, wajah, event NVR, event deteksi AI. Data disimpan di volume `camera_data`. |
-| **frontend** | Docker Compose | `5173` | React + Vite. Dashboard utama + halaman konfigurasi AI. |
+| **frontend** | Docker Compose | `5173` lokal, `8088` server | Dashboard utama + halaman konfigurasi AI. |
 | **analyzer** | Docker Compose (profile `ai`) | — | YOLOv8n + InsightFace. Baca RTSP dari mediamtx, kirim event ke backend. **Opsional.** |
 
 ---
 
 ## Cara Menjalankan
 
-### 1. Jalankan MediaMTX (di host)
-
-MediaMTX harus jalan di host Mac karena ffmpeg pakai **VideoToolbox** hardware encoder yang tidak tersedia dalam container.
+### 1. Jalankan Stack Docker
 
 ```bash
 cd /path/to/home-dashboard/home-dashboard
 
-# Jalankan di background
-./mediamtx mediamtx.yml &
-```
-
-MediaMTX akan otomatis memanggil `ffmpeg` via `runOnInit` untuk tiap channel saat ada viewer, mengambil stream RTSPS dari NVR dan mempublikasikan sebagai HLS di `http://localhost:8888/ch1/index.m3u8`.
-
-### 2. Jalankan Backend + Frontend (Docker Compose)
-
-```bash
-cd /path/to/home-dashboard/home-dashboard
-
-# Build (pertama kali atau setelah ada perubahan kode)
-docker compose build
-
-# Jalankan
-docker compose up -d
+# Build + recreate service yang berubah
+docker compose up -d --build
 
 # Lihat log
 docker compose logs -f
 ```
 
-Buka **http://localhost:5173** di browser.
+Di Mac, `docker-compose.override.yml` otomatis ikut terbaca. Itu berarti:
+- `mtx` ikut jalan di Docker, tidak perlu `./mediamtx` atau `sh` manual.
+- Browser tetap akses stream lewat frontend nginx proxy.
+- Frontend bisa dibuka di **http://localhost:5173**.
 
-### 3. Jalankan Analyzer AI (opsional)
+Saat container `mtx` start, MediaMTX langsung mengeksekusi `runOnInit` untuk `ch1` sampai `ch4`, lalu otomatis restart ffmpeg jika proses stream keluar.
+
+### 2. Jalankan Analyzer AI (opsional)
 
 Analyzer membutuhkan build lebih lama (~5 menit) karena mengunduh PyTorch CPU dan model YOLOv8.
 
@@ -82,6 +71,24 @@ Setelah analyzer jalan, buka halaman **⚙ Konfigurasi** di dashboard untuk:
 - Mendaftarkan wajah penghuni
 - Melihat riwayat event deteksi
 
+### 3. Update Service dengan Docker Compose
+
+```bash
+cd /path/to/home-dashboard/home-dashboard
+
+# Update image / source code lalu recreate service utama
+docker compose up -d --build mtx backend frontend
+
+# Jika hanya config berubah dan image tidak berubah
+docker compose restart mtx backend frontend
+```
+
+Jika yang berubah adalah kredensial stream di menu Config, restart `mtx` agar `runOnInit` mengambil ulang nilai terbaru dari `/api/nvr-config`:
+
+```bash
+docker compose restart mtx
+```
+
 ---
 
 ## Konfigurasi Environment
@@ -90,7 +97,8 @@ Setelah analyzer jalan, buka halaman **⚙ Konfigurasi** di dashboard untuk:
 
 | Variable | Default | Keterangan |
 |----------|---------|------------|
-| `BASE_URL` | `http://localhost:8888` | URL HLS mediamtx (dilihat dari dalam container, gunakan `http://host.docker.internal:8888` jika perlu) |
+| `BASE_URL` | kosong | URL HLS yang dikirim ke browser. Stream dilayani sebagai path relatif dan diproxy oleh frontend nginx ke service `mtx`. |
+| `INTERNAL_HLS_URL` | `http://mtx:8888` | URL internal untuk health check stream dari backend ke container `mtx` |
 | `DB_PATH` | `/data/cameras.db` | Path SQLite database (di dalam volume) |
 | `FACE_PHOTO_DIR` | `/data/face_photos` | Direktori foto wajah terdaftar |
 | `SNAPSHOT_DIR` | `/data/snapshots` | Direktori snapshot kamera dari analyzer |
@@ -106,7 +114,7 @@ Setelah analyzer jalan, buka halaman **⚙ Konfigurasi** di dashboard untuk:
 | Variable | Default | Keterangan |
 |----------|---------|------------|
 | `BACKEND_URL` | `http://backend:5000` | URL internal backend |
-| `MTX_RTSP` | `rtsp://host.docker.internal:8554` | Base URL RTSP mediamtx |
+| `MTX_RTSP` | `rtsp://mtx:8554` | Base URL RTSP mediamtx |
 | `SNAPSHOT_DIR` | `/data/snapshots` | Direktori simpan snapshot |
 | `PROCESS_EVERY` | `8` | Proses 1 frame setiap N frame (hemat CPU) |
 | `FACE_THRESH` | `0.40` | Threshold similarity untuk pengenalan wajah (0–1) |
@@ -135,10 +143,13 @@ Jika 403 karena akun terkunci (Dahua RmLock), backend baca durasi lock dari resp
 
 ```
 home-dashboard/
-├── mediamtx.yml          # Konfigurasi MediaMTX: paths ch1–ch4, runOnInit ffmpeg
-├── start_stream.sh       # Script ffmpeg dipanggil MediaMTX per channel
-├── start_custom_stream.sh # Script ffmpeg untuk channel custom (tambah lewat UI)
-├── docker-compose.yml    # Definisi service: backend, frontend, analyzer
+├── docker-compose.yml           # Definisi service utama: mtx, backend, frontend, analyzer
+├── docker-compose.override.yml  # Override lokal Mac: port expose + URL lokal
+├── mtx/
+│   ├── Dockerfile               # Image MediaMTX + ffmpeg + python3
+│   ├── mediamtx.yml             # Paths ch1–ch4 + runOnInit ffmpeg
+│   └── start_stream.sh          # Script stream bawaan ch1–ch4
+├── start_custom_stream.sh       # Legacy host script
 │
 ├── backend/
 │   ├── app.py            # Flask API: kamera, NVR events, zona, wajah, AI events
@@ -197,20 +208,20 @@ home-dashboard/
 docker compose ps
 
 # Restart jika perlu
-docker compose down && docker compose up -d
+docker compose down && docker compose up -d --build
 ```
 
 **Video tidak muncul (CCTV kosong)**
 ```bash
-# Cek mediamtx jalan di host
-pgrep -a mediamtx
+# Cek semua service dan status mtx
+docker compose ps
+docker compose logs mtx --tail=100
 
-# Jalankan jika belum
-cd /path/to/home-dashboard/home-dashboard
-./mediamtx mediamtx.yml &
+# Recreate mtx + backend jika perlu ambil config ulang
+docker compose up -d --build mtx backend
 
-# Tes HLS
-curl -s http://localhost:8888/ch1/index.m3u8 -o /dev/null -w "%{http_code}\n"
+# Tes HLS lewat proxy frontend
+curl -s http://localhost:5173/ch1/video1_stream.m3u8 -o /dev/null -w "%{http_code}\n"
 ```
 
 **NVR Event Log "Terputus"**

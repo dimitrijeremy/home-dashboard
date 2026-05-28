@@ -1,0 +1,41 @@
+logLevel: info
+readTimeout: 30s
+writeTimeout: 30s
+api: yes
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50MB
+hlsVariant: mpegts
+# hlsAllowOrigins:
+#   - "*"
+hlsAlwaysRemux: yes
+
+# start_stream.sh di-mount ke /app/ via docker-compose volume
+paths:
+  ch1:
+    runOnInit: /app/start_stream.sh 1
+    runOnInitRestart: yes
+
+  ch2:
+    runOnInit: /app/start_stream.sh 2
+    runOnInitRestart: yes
+
+  ch3:
+    runOnInit: /app/start_stream.sh 3
+    runOnInitRestart: yes
+
+  ch4:
+    runOnInit: /app/start_stream.sh 4
+    runOnInitRestart: yes
+
+  '~^custom_[0-9a-f]+$': {}

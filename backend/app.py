@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -26,11 +27,62 @@ CORS(app)
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8888")
+# INTERNAL_HLS_URL: URL yang digunakan backend container untuk cek stream status.
+# Jika BASE_URL kosong (server: stream URL relatif, proxy via nginx), set ini ke
+# URL internal mediamtx container, mis. http://mediamtx:8888
+INTERNAL_HLS_URL = os.getenv("INTERNAL_HLS_URL", BASE_URL).rstrip('/')
+MTX_API_URL = (os.getenv("MTX_API_URL") or "http://mtx:9997").rstrip('/')
 DB_PATH  = os.getenv("DB_PATH", "/data/cameras.db")
-CUSTOM_STREAM_SCRIPT = os.path.join(APP_DIR, "start_custom_stream.sh")
+CUSTOM_STREAM_SCRIPT = os.getenv("CUSTOM_STREAM_SCRIPT") or os.path.join(APP_DIR, "start_custom_stream.sh")
 FACE_PHOTO_DIR = os.getenv("FACE_PHOTO_DIR", "/data/face_photos")
 SNAPSHOT_DIR   = os.getenv("SNAPSHOT_DIR",   "/data/snapshots")
 CUSTOM_STREAM_PROCS = {}
+
+
+def _public_stream_url(path_name):
+    return f"{BASE_URL}/{path_name}/index.m3u8" if BASE_URL else f"/{path_name}/index.m3u8"
+
+
+def _rewrite_stream_url_for_current_runtime(stream_url):
+    stream_url = (stream_url or "").strip()
+    if not stream_url:
+        return stream_url
+
+    parts = urlsplit(stream_url)
+    if parts.scheme in {"http", "https"} and parts.hostname in {"localhost", "127.0.0.1"}:
+        path = parts.path.strip("/")
+        if path:
+            return _public_stream_url(path.split("/")[0])
+
+    return stream_url
+
+
+def _mtx_api_request(method, path):
+    if not MTX_API_URL:
+        return None
+
+    try:
+        res = requests.request(method, f"{MTX_API_URL}{path}", timeout=3)
+        res.raise_for_status()
+        if not res.text:
+            return {}
+        return res.json()
+    except Exception:
+        return None
+
+
+def _mtx_paths_map():
+    payload = _mtx_api_request("GET", "/v3/paths/list") or {}
+    items = payload.get("items") or []
+    return {item.get("name"): item for item in items if item.get("name")}
+
+
+def _mtx_kick_publisher(path_seg):
+    path_info = _mtx_api_request("GET", f"/v3/paths/get/{path_seg}") or {}
+    source = path_info.get("source") or {}
+    if source.get("type") != "rtspSession" or not source.get("id"):
+        return False
+    return _mtx_api_request("POST", f"/v3/rtspsessions/kick/{source['id']}") is not None
 
 # ── NVR Config ──────────────────────────────────────────────
 DVR_HOST      = os.getenv("DVR_HOST", "10.10.30.2")
@@ -122,23 +174,46 @@ def extract_custom_path_name(stream_url):
     return None
 
 
+def _kill_orphan_custom_streams(path_name):
+    current_pid = os.getpid()
+    for pid_name in os.listdir('/proc'):
+        if not pid_name.isdigit():
+            continue
+        pid = int(pid_name)
+        if pid == current_pid:
+            continue
+        try:
+            with open(f'/proc/{pid_name}/cmdline', 'rb') as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        cmdline = raw.replace(b'\x00', b' ').decode('utf-8', errors='ignore')
+        if path_name not in cmdline:
+            continue
+        if 'start_custom_stream.sh' not in cmdline and 'ffmpeg' not in cmdline:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+
+
 def stop_custom_stream(path_name):
     entry = CUSTOM_STREAM_PROCS.pop(path_name, None)
-    if not entry:
-        return
-
-    proc = entry["proc"]
-    log_handle = entry["log"]
-    if proc.poll() is None:
-        proc.terminate()
-    log_handle.close()
+    if entry:
+        proc = entry["proc"]
+        log_handle = entry["log"]
+        if proc.poll() is None:
+            proc.terminate()
+        log_handle.close()
+    _kill_orphan_custom_streams(path_name)
 
 
 def launch_custom_stream(path_name, rtsp_url, channel):
-    existing = CUSTOM_STREAM_PROCS.get(path_name)
-    if existing and existing["proc"].poll() is None:
-        return
-
     stop_custom_stream(path_name)
     source_url = build_rtsp_source(rtsp_url, channel)
     log_handle = open(f"/tmp/{path_name}.log", "ab")
@@ -147,7 +222,6 @@ def launch_custom_stream(path_name, rtsp_url, channel):
         cwd=APP_DIR,
         stdout=log_handle,
         stderr=log_handle,
-        start_new_session=True,
     )
     CUSTOM_STREAM_PROCS[path_name] = {"proc": proc, "log": log_handle}
 
@@ -170,6 +244,35 @@ def restore_custom_streams(con):
 def stop_all_custom_streams():
     for path_name in list(CUSTOM_STREAM_PROCS.keys()):
         stop_custom_stream(path_name)
+
+
+def sync_camera_rows(con):
+    builtin_rows = con.execute(
+        "SELECT id FROM cameras WHERE builtin=1 ORDER BY sort_order, id"
+    ).fetchall()
+
+    for channel in range(1, 5):
+        stream_url = _public_stream_url(f"ch{channel}")
+        name = f"Camera {channel}"
+        if channel <= len(builtin_rows):
+            con.execute(
+                "UPDATE cameras SET name=?, stream_url=?, sort_order=? WHERE id=?",
+                (name, stream_url, channel, builtin_rows[channel - 1][0]),
+            )
+        else:
+            con.execute(
+                "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel) VALUES (?,?,?,?,?,?)",
+                (name, stream_url, channel, 1, None, None),
+            )
+
+    custom_rows = con.execute(
+        "SELECT id, stream_url FROM cameras WHERE builtin=0"
+    ).fetchall()
+    for row in custom_rows:
+        row_id, stream_url = row[0], row[1]
+        normalized = _rewrite_stream_url_for_current_runtime(stream_url)
+        if normalized != stream_url:
+            con.execute("UPDATE cameras SET stream_url=? WHERE id=?", (normalized, row_id))
 
 def init_db():
     """Create table and seed default 4 channels if DB is new."""
@@ -230,18 +333,7 @@ def init_db():
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_user', ?)" , (DVR_EVENT_USER,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_pass', ?)" , (DVR_EVENT_PASS,))
     ensure_detection_columns(con)
-    # Only seed once (when table is empty)
-    if con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] == 0:
-        defaults = [
-            ("Camera 1", f"{BASE_URL}/ch1/index.m3u8", 1, 1, None, None),
-            ("Camera 2", f"{BASE_URL}/ch2/index.m3u8", 2, 1, None, None),
-            ("Camera 3", f"{BASE_URL}/ch3/index.m3u8", 3, 1, None, None),
-            ("Camera 4", f"{BASE_URL}/ch4/index.m3u8", 4, 1, None, None),
-        ]
-        con.executemany(
-            "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel) VALUES (?,?,?,?,?,?)",
-            defaults
-        )
+    sync_camera_rows(con)
     con.commit()
     restore_custom_streams(con)
     con.close()
@@ -254,6 +346,20 @@ def get_cameras():
         "SELECT id, name, stream_url, builtin FROM cameras ORDER BY sort_order, id"
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/mtx-status', methods=['GET'])
+def get_mtx_status():
+    paths_payload = _mtx_api_request("GET", "/v3/paths/list")
+    if paths_payload is None:
+        return jsonify({'ok': False, 'error': 'MediaMTX control API unavailable'}), 503
+
+    sessions_payload = _mtx_api_request("GET", "/v3/rtspsessions/list") or {"items": []}
+    return jsonify({
+        'ok': True,
+        'paths': paths_payload.get('items') or [],
+        'rtsp_sessions': sessions_payload.get('items') or [],
+    })
 
 
 @app.route('/api/cameras', methods=['POST'])
@@ -370,17 +476,40 @@ def stream_status():
     rows = get_db().execute(
         "SELECT id, name, stream_url, builtin FROM cameras ORDER BY sort_order, id"
     ).fetchall()
+    mtx_paths = _mtx_paths_map()
 
     def status_check_url(stream_url):
+        # Relative URL (e.g. /ch1/index.m3u8) — proxy via nginx, tapi backend
+        # perlu akses langsung ke mediamtx pakai INTERNAL_HLS_URL.
+        if stream_url.startswith('/'):
+            if INTERNAL_HLS_URL:
+                return INTERNAL_HLS_URL + stream_url
+            return None
         parts = urlsplit(stream_url)
         if parts.hostname in {"localhost", "127.0.0.1"}:
+            if INTERNAL_HLS_URL:
+                query = f"?{parts.query}" if parts.query else ""
+                return f"{INTERNAL_HLS_URL}{parts.path}{query}"
             port = f":{parts.port}" if parts.port else ""
             return urlunsplit(parts._replace(netloc=f"host.docker.internal{port}"))
         return stream_url
 
     def check(row):
         try:
-            res = urllib.request.urlopen(status_check_url(row['stream_url']), timeout=3)
+            path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]
+            if path_seg in mtx_paths:
+                path_info = mtx_paths[path_seg]
+                return {
+                    'id': row['id'],
+                    'name': row['name'],
+                    'online': bool(path_info.get('ready')),
+                    'builtin': bool(row['builtin']),
+                }
+
+            check_url = status_check_url(row['stream_url'])
+            if not check_url:
+                return {'id': row['id'], 'name': row['name'], 'online': False, 'builtin': bool(row['builtin'])}
+            res = urllib.request.urlopen(check_url, timeout=3)
             online = res.status == 200
         except Exception:
             online = False
@@ -463,6 +592,117 @@ def _get_nvr_stream_creds():
     user   = _db_setting('nvr_stream_user') or DVR_USER
     passwd = _db_setting('nvr_stream_pass') or DVR_PASS
     return user, passwd
+
+
+def _nvr_auth_candidates():
+    creds = []
+    seen = set()
+    for pair in (_get_nvr_event_creds(), _get_nvr_stream_creds()):
+        if pair in seen:
+            continue
+        seen.add(pair)
+        creds.append(pair)
+    return creds
+
+
+def _nvr_cgi_text(path, timeout=8):
+    if not DVR_HOST:
+        raise RuntimeError('NVR host is not configured')
+
+    last_error = 'NVR request failed'
+    url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}{path}"
+    for user, passwd in _nvr_auth_candidates():
+        try:
+            resp = requests.get(url, auth=HTTPDigestAuth(user, passwd), timeout=(5, timeout))
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        if resp.status_code == 200:
+            return resp.text
+
+        last_error = f"HTTP {resp.status_code}"
+
+    raise RuntimeError(last_error)
+
+
+def _parse_dahua_kv_text(raw_text):
+    pairs = {}
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        pairs[key.strip()] = value.strip()
+    return pairs
+
+
+def _build_nvr_info_payload():
+    system_info = _parse_dahua_kv_text(_nvr_cgi_text('/cgi-bin/magicBox.cgi?action=getSystemInfo'))
+    device_type = _parse_dahua_kv_text(_nvr_cgi_text('/cgi-bin/magicBox.cgi?action=getDeviceType'))
+    storage_info = _parse_dahua_kv_text(_nvr_cgi_text('/cgi-bin/storageDevice.cgi?action=getDeviceAllInfo'))
+    channel_info = _parse_dahua_kv_text(_nvr_cgi_text('/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle'))
+
+    disks = {}
+    for key, value in storage_info.items():
+        match = re.match(r'list\.info\[0\]\.Detail\[(\d+)\]\.(.+)', key)
+        if not match:
+            continue
+        disk = disks.setdefault(int(match.group(1)), {})
+        field = match.group(2)
+        disk[field] = value
+
+    disk_rows = []
+    for idx in sorted(disks):
+        disk = disks[idx]
+        try:
+            total_bytes = int(float(disk.get('TotalBytes', '0')))
+        except ValueError:
+            total_bytes = 0
+        try:
+            used_bytes = int(float(disk.get('UsedBytes', '0')))
+        except ValueError:
+            used_bytes = 0
+        usage_percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else None
+        disk_rows.append({
+            'path': disk.get('Path') or f'disk-{idx}',
+            'type': disk.get('Type') or '',
+            'is_error': disk.get('IsError', 'false').lower() == 'true',
+            'total_bytes': total_bytes,
+            'used_bytes': used_bytes,
+            'usage_percent': usage_percent,
+        })
+
+    channels = []
+    for key, value in channel_info.items():
+        match = re.match(r'table\.ChannelTitle\[(\d+)\]\.Name', key)
+        if not match:
+            continue
+        index = int(match.group(1)) + 1
+        channels.append({'index': index, 'name': value})
+    channels.sort(key=lambda item: item['index'])
+
+    with _nvr_lock:
+        event_status = dict(_nvr_status)
+
+    return {
+        'host': DVR_HOST,
+        'http_port': DVR_HTTP_PORT,
+        'device': {
+            'model': device_type.get('type') or system_info.get('updateSerial') or '',
+            'type_code': system_info.get('deviceType') or '',
+            'processor': system_info.get('processor') or '',
+            'serial_number': system_info.get('serialNumber') or '',
+            'update_serial': system_info.get('updateSerial') or '',
+        },
+        'storage': {
+            'state': storage_info.get('list.info[0].State') or '',
+            'health_flag': storage_info.get('list.info[0].HealthDataFlag') or '',
+            'disks': disk_rows,
+        },
+        'channels': channels,
+        'events': event_status,
+    }
 
 
 def _restart_host_rtsp_publisher(path_seg):
@@ -648,6 +888,14 @@ def get_nvr_config():
         'event_user': event_user,
         'event_pass': event_pass,
     })
+
+
+@app.route('/api/nvr-info', methods=['GET'])
+def get_nvr_info():
+    try:
+        return jsonify({'ok': True, 'info': _build_nvr_info_payload()})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)[:200]}), 502
 
 
 @app.route('/api/nvr-config', methods=['POST'])

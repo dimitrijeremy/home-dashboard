@@ -186,3 +186,10 @@ export async function postNvrConfig(data) {
   }
   return res.json()
 }
+
+export async function fetchNvrInfo() {
+  const res = await fetch(url('/api/nvr-info'))
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to fetch NVR info')
+  return data.info
+}

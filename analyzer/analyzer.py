@@ -228,10 +228,11 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
         cx_norm = ((x1 + x2) / 2) / w
         cy_norm = ((y1 + y2) / 2) / h
         centroid = Point(cx_norm, cy_norm)
+        foot_point = Point(cx_norm, min(1.0, y2 / h))
 
         # ── Zone intrusion check ──────────────────────────────────────────
         for zone in cam_zones:
-            if zone["poly"].contains(centroid):
+            if zone["poly"].covers(foot_point):
                 if not _cooling(channel_id, f"zone_{zone['id']}"):
                     person_name, face_conf = _identify_person(frame, x1, y1, x2, y2) if has_face_db else (None, 0.0)
                     log.info(

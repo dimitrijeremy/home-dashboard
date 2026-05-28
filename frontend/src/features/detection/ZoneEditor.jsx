@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
+import Hls from 'hls.js'
 import { fetchZones, addZone, deleteZone, patchZone, cameraSnapshotUrl } from '../../services/api'
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
@@ -115,8 +116,55 @@ export default function ZoneEditor({ camera }) {
   const [snapError, setSnapError]   = useState(false)
   const [saving, setSaving]         = useState(false)
   const imgRef = useRef(null)
+  // video fallback for live stream frame capture
+  const videoRef = useRef(null)
+  const hlsRef   = useRef(null)
+  const [videoReady, setVideoReady] = useState(false)
+  const [capturedFrame, setCapturedFrame] = useState(null) // object URL
 
   const snapUrl = cameraSnapshotUrl(camera.id)
+
+  // When snapshot fails, attach HLS player to grab a frame
+  useEffect(() => {
+    if (!snapError || !camera.stream_url) return
+    const video = document.createElement('video')
+    videoRef.current = video
+    video.muted = true
+    video.playsInline = true
+
+    const onLoadedData = () => setVideoReady(true)
+    video.addEventListener('loadeddata', onLoadedData)
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: false, lowLatencyMode: false })
+      hlsRef.current = hls
+      hls.attachMedia(video)
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(camera.stream_url))
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = camera.stream_url
+      video.load()
+    }
+
+    return () => {
+      video.removeEventListener('loadeddata', onLoadedData)
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+    }
+  }, [snapError, camera.stream_url])
+
+  const captureFrame = () => {
+    const video = videoRef.current
+    if (!video || !videoReady) return
+    const canvas = document.createElement('canvas')
+    canvas.width  = video.videoWidth  || 640
+    canvas.height = video.videoHeight || 360
+    canvas.getContext('2d').drawImage(video, 0, 0)
+    canvas.toBlob(blob => {
+      if (!blob) return
+      const url = URL.createObjectURL(blob)
+      setCapturedFrame(prev => { if (prev) URL.revokeObjectURL(prev); return url })
+      setImgSize({ w: canvas.width, h: canvas.height })
+    })
+  }
 
   useEffect(() => {
     fetchZones()
@@ -172,23 +220,29 @@ export default function ZoneEditor({ camera }) {
   return (
     <div className="zone-editor">
       {/* Camera snapshot + canvas overlay */}
-      <div className="zone-canvas-wrap">
-        {snapError ? (
+      <div className={`zone-canvas-wrap${snapError && !capturedFrame ? ' is-placeholder' : ''}`}>
+        {snapError && !capturedFrame ? (
           <div className="zone-snap-placeholder">
             <span>📷 Snapshot belum tersedia</span>
-            <small>Jalankan analyzer service terlebih dahulu</small>
+            {videoReady ? (
+              <button className="btn-icon" style={{ marginTop: 8 }} onClick={captureFrame}>
+                📸 Ambil frame dari stream
+              </button>
+            ) : (
+              <small>Memuat stream{camera.stream_url ? '…' : ' — URL stream tidak tersedia'}</small>
+            )}
           </div>
         ) : (
           <img
             ref={imgRef}
-            src={snapUrl}
+            src={capturedFrame || snapUrl}
             alt={camera.name}
             className="zone-snap-img"
             onLoad={onImgLoad}
-            onError={() => setSnapError(true)}
+            onError={() => { if (!capturedFrame) setSnapError(true) }}
           />
         )}
-        {!snapError && imgSize && (
+        {((!snapError && imgSize) || (capturedFrame && imgSize)) && (
           <ZoneCanvas
             imgSize={imgSize}
             zones={zones}

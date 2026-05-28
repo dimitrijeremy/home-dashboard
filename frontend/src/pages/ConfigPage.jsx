@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { fetchCameras, fetchNvrConfig, postNvrConfig } from '../services/api'
+import { fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo } from '../services/api'
 import ZoneEditor from '../features/detection/ZoneEditor'
 import FaceManager from '../features/detection/FaceManager'
 import EventHistory from '../features/detection/EventHistory'
@@ -24,6 +24,20 @@ export default function ConfigPage({ onBack }) {
   const [showPass, setShowPass]   = useState(false)
   const [nvrSaving, setNvrSaving] = useState(false)
   const [nvrMsg, setNvrMsg]       = useState(null)  // { ok, text }
+  const [nvrInfo, setNvrInfo]     = useState(null)
+  const [nvrInfoLoading, setNvrInfoLoading] = useState(false)
+
+  const formatBytes = (value) => {
+    if (!value) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    let size = value
+    let idx = 0
+    while (size >= 1024 && idx < units.length - 1) {
+      size /= 1024
+      idx += 1
+    }
+    return `${size.toFixed(idx < 2 ? 0 : 1)} ${units[idx]}`
+  }
 
   useEffect(() => {
     fetchCameras()
@@ -36,6 +50,7 @@ export default function ConfigPage({ onBack }) {
 
   useEffect(() => {
     if (tab === 'nvr') {
+      setNvrInfoLoading(true)
       fetchNvrConfig()
         .then(cfg => {
           setStreamUser(cfg.stream_user || '')
@@ -44,6 +59,11 @@ export default function ConfigPage({ onBack }) {
           setNvrPass(cfg.event_pass || '')
         })
         .catch(() => setNvrMsg({ ok: false, text: 'Gagal memuat konfigurasi NVR' }))
+
+      fetchNvrInfo()
+        .then(setNvrInfo)
+        .catch(err => setNvrMsg(prev => prev || { ok: false, text: err.message || 'Gagal memuat info NVR' }))
+        .finally(() => setNvrInfoLoading(false))
     }
   }, [tab])
 
@@ -145,6 +165,64 @@ export default function ConfigPage({ onBack }) {
               Kredensial NVR untuk stream kamera channel 1-4 dan event deteksi.
               Setelah mengganti kredensial stream, restart stream dari dashboard agar MediaMTX membaca nilai terbaru.
             </div>
+
+            <div className="nvr-info-block">
+              <div className="nvr-cred-group-title">Info dari API NVR</div>
+              {nvrInfoLoading && <div className="nvr-info-empty">Memuat info NVR…</div>}
+              {!nvrInfoLoading && nvrInfo && (
+                <>
+                  <div className="nvr-info-grid">
+                    <div className="nvr-info-card">
+                      <div className="nvr-info-title">Perangkat</div>
+                      <div className="nvr-info-kv"><span>Model</span><strong>{nvrInfo.device.model || '—'}</strong></div>
+                      <div className="nvr-info-kv"><span>Serial</span><strong>{nvrInfo.device.serial_number || '—'}</strong></div>
+                      <div className="nvr-info-kv"><span>Processor</span><strong>{nvrInfo.device.processor || '—'}</strong></div>
+                      <div className="nvr-info-kv"><span>Host</span><strong>{`${nvrInfo.host}:${nvrInfo.http_port}`}</strong></div>
+                    </div>
+
+                    <div className="nvr-info-card">
+                      <div className="nvr-info-title">Event Stream</div>
+                      <div className="nvr-info-kv"><span>Status</span><strong className={nvrInfo.events.connected ? 'nvr-ok' : 'nvr-bad'}>{nvrInfo.events.connected ? 'Tersambung' : 'Terputus'}</strong></div>
+                      <div className="nvr-info-kv"><span>Last Event</span><strong>{nvrInfo.events.last_event || '—'}</strong></div>
+                      <div className="nvr-info-kv"><span>Error</span><strong>{nvrInfo.events.error || '—'}</strong></div>
+                    </div>
+
+                    <div className="nvr-info-card">
+                      <div className="nvr-info-title">Storage</div>
+                      <div className="nvr-info-kv"><span>Status</span><strong>{nvrInfo.storage.state || '—'}</strong></div>
+                      <div className="nvr-info-kv"><span>Health Flag</span><strong>{nvrInfo.storage.health_flag || '—'}</strong></div>
+                      <div className="nvr-disk-list">
+                        {nvrInfo.storage.disks.map((disk) => (
+                          <div key={disk.path} className="nvr-disk-row">
+                            <div>
+                              <strong>{disk.path}</strong>
+                              <span>{disk.type || 'ReadWrite'}</span>
+                            </div>
+                            <div>
+                              <strong>{formatBytes(disk.used_bytes)} / {formatBytes(disk.total_bytes)}</strong>
+                              <span className={disk.is_error ? 'nvr-bad' : ''}>{disk.usage_percent != null ? `${disk.usage_percent}% terpakai` : '—'}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="nvr-info-card">
+                    <div className="nvr-info-title">Nama Channel dari NVR</div>
+                    <div className="nvr-channel-grid">
+                      {nvrInfo.channels.map((channel) => (
+                        <div key={channel.index} className="nvr-channel-chip">
+                          <span>{`Ch ${channel.index}`}</span>
+                          <strong>{channel.name}</strong>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
             <form className="nvr-cred-form" onSubmit={handleNvrSave}>
               <div className="nvr-cred-group-title">Stream CCTV Channel 1-4</div>
               <div className="nvr-cred-field">

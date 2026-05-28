@@ -2,21 +2,6 @@ import React, { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 
 function normalizeStreamUrl(src) {
-  try {
-    const base = typeof window !== 'undefined' ? window.location.href : 'http://localhost'
-    const url = new URL(src, base)
-
-    // mediamtx playlists expose separate audio/video tracks.
-    // For the dashboard we prefer the video-only playlist because audio is not
-    // required and the single-track path avoids extra SourceBuffer churn.
-    if (/^\/(?:ch\d+|custom_[0-9a-f]+)\/index\.m3u8$/.test(url.pathname)) {
-      url.pathname = url.pathname.replace(/\/index\.m3u8$/, '/video1_stream.m3u8')
-      return url.toString()
-    }
-  } catch {
-    // Leave custom or invalid URLs untouched.
-  }
-
   return src
 }
 
@@ -74,14 +59,19 @@ const HLS_CONFIG = {
   },
 }
 
+const MAX_RETRIES = 5
+
 export default function CCTVPlayer({ src, name, onRemove, removable }) {
   const videoRef = useRef(null)
   const hlsRef   = useRef(null)
   const retryRef = useRef(null)
   const deadRef  = useRef(false)
   const recoverRef = useRef(0)
+  const retryCountRef = useRef(0)
   const [status, setStatus] = useState('loading')
   const [muted, setMuted]   = useState(true)
+  const [errorMsg, setErrorMsg] = useState(null)
+  const [retryKey, setRetryKey] = useState(0)
 
   useEffect(() => {
     const video = videoRef.current
@@ -90,12 +80,23 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
 
     deadRef.current = false
     recoverRef.current = 0
+    retryCountRef.current = 0
 
     function cleanup() {
       clearTimeout(retryRef.current)
       video.onloadeddata = null
+      video.oncanplay = null
+      video.oncanplaythrough = null
       video.onplaying = null
+      video.ontimeupdate = null
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+    }
+
+    function attachDead(msg) {
+      deadRef.current = true
+      cleanup()
+      setErrorMsg(msg)
+      setStatus('dead')
     }
 
     function attach() {
@@ -103,21 +104,31 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
       cleanup()
       setStatus('loading')
 
-      // Ensure muted+autoplay attributes are set before any load.
-      // React's muted JSX prop does NOT reflect to the DOM attribute,
-      // so we set both the property and the attribute here.
-      video.muted = true
-      video.setAttribute('muted', '')
+      // Only reset muted to true on the very first attach.
+      // Subsequent retries preserve whatever the user chose.
+      if (retryCountRef.current === 0) {
+        video.muted = true
+        video.setAttribute('muted', '')
+      }
+
+      const requestPlay = () => {
+        if (deadRef.current || !video.paused || !video.srcObject && video.readyState < 2) return
+        video.play().catch(() => {})
+      }
 
       const markLive = () => {
         if (deadRef.current) return
         recoverRef.current = 0
         setStatus('live')
-        video.play().catch(() => {})
       }
 
-      video.onloadeddata = markLive
+      video.onloadeddata = requestPlay
+      video.oncanplay = requestPlay
+      video.oncanplaythrough = requestPlay
       video.onplaying = markLive
+      video.ontimeupdate = () => {
+        if (!deadRef.current && video.currentTime > 0) markLive()
+      }
 
       if (Hls.isSupported()) {
         const hls = new Hls(HLS_CONFIG)
@@ -133,7 +144,11 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
           // Ask the browser to start playback, but only mark the stream live once
           // loadeddata/playing fires. MANIFEST_PARSED itself is too early and can
           // leave the user staring at a black frame during initial buffering.
-          video.play().catch(() => {})
+          requestPlay()
+        })
+
+        hls.on(Hls.Events.FRAG_BUFFERED, () => {
+          requestPlay()
         })
 
         hls.on(Hls.Events.ERROR, (_, data) => {
@@ -150,6 +165,11 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
           } else if (data.response?.code === 404) {
             // Stream not published yet (e.g. ch1 no camera).
             // Slow retry — don't hammer mediamtx with rapid reconnects.
+            if (retryCountRef.current >= MAX_RETRIES) {
+              attachDead('Stream tidak tersedia setelah beberapa percobaan (404)')
+              return
+            }
+            retryCountRef.current += 1
             cleanup()
             setStatus('loading')
             retryRef.current = setTimeout(attach, 8000)
@@ -164,6 +184,14 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
           }
 
           // True fatal error after local recovery attempts are exhausted.
+          if (retryCountRef.current >= MAX_RETRIES) {
+            const msg = data.type === Hls.ErrorTypes.NETWORK_ERROR
+              ? `Koneksi gagal (${data.response?.code ?? 'network error'})`
+              : `Error stream (${data.details ?? data.type})`
+            attachDead(msg)
+            return
+          }
+          retryCountRef.current += 1
           cleanup()
           setStatus('loading')
           retryRef.current = setTimeout(attach, 6000)
@@ -172,8 +200,16 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
         // Safari native HLS — autoPlay + muted handles play() automatically
         video.src = effectiveSrc
         video.load()
-        video.addEventListener('canplay', () => { if (!deadRef.current) markLive() }, { once: true })
-        video.addEventListener('error',   () => { if (!deadRef.current) { retryRef.current = setTimeout(attach, 4000) } }, { once: true })
+        video.addEventListener('canplay', () => { if (!deadRef.current) requestPlay() }, { once: true })
+        video.addEventListener('error', () => {
+          if (deadRef.current) return
+          if (retryCountRef.current >= MAX_RETRIES) {
+            attachDead('Stream tidak tersedia')
+            return
+          }
+          retryCountRef.current += 1
+          retryRef.current = setTimeout(attach, 4000)
+        }, { once: true })
       } else {
         setStatus('error')
       }
@@ -181,10 +217,14 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
 
     attach()
     return () => { deadRef.current = true; cleanup() }
-  }, [src])
+  }, [src, retryKey])
 
   useEffect(() => {
-    if (videoRef.current) videoRef.current.muted = muted
+    if (videoRef.current) {
+      videoRef.current.muted = muted
+      if (!muted) videoRef.current.removeAttribute('muted')
+      else videoRef.current.setAttribute('muted', '')
+    }
   }, [muted])
 
   const toggleFullscreen = () => {
@@ -214,9 +254,10 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
         <video
           ref={(el) => {
             videoRef.current = el
-            if (el) {
-              el.muted = true              // DOM property
-              el.setAttribute('muted', '') // DOM attribute — required for autoplay policy
+            if (el && !hlsRef.current) {
+              // Only set muted on first mount (before any stream attaches)
+              el.muted = true
+              el.setAttribute('muted', '')
             }
           }}
           autoPlay
@@ -228,7 +269,30 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
         {status === 'error' && (
           <div className="cam-error">
             <span className="cam-error-icon">📷</span>
-            <span>Stream tidak tersedia</span>
+            <span>Browser tidak mendukung HLS</span>
+          </div>
+        )}
+        {status === 'dead' && (
+          <div className="cam-error">
+            <span className="cam-error-icon">⚠️</span>
+            <span>{errorMsg || 'Stream tidak tersedia'}</span>
+            <button
+              className="btn-icon"
+              style={{ marginTop: '8px', fontSize: '12px', padding: '4px 10px' }}
+              onClick={() => {
+                retryCountRef.current = 0
+                deadRef.current = false
+                setErrorMsg(null)
+                const video = videoRef.current
+                if (video) { video.muted = true; video.setAttribute('muted', '') }
+                setStatus('loading')
+                setMuted(true)
+                // Re-trigger the effect by forcing a re-attach via a local attach call
+                // We can't call attach() here (it's scoped inside useEffect),
+                // so we bump a separate state to force effect re-run.
+                setRetryKey(k => k + 1)
+              }}
+            >↺ Coba lagi</button>
           </div>
         )}
       </div>
