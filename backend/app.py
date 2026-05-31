@@ -1180,7 +1180,8 @@ def _nvr_guard_get() -> dict:
             return {"ok": True, "armed": armed, "raw": body[:200]}
         return {"ok": False, "error": f"HTTP {resp.status_code}"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        print(f"[NVR-GUARD] get error: {e}", flush=True)
+        return {"ok": False, "error": "NVR connection failed"}
 
 
 def _trigger_alarm(event_body):

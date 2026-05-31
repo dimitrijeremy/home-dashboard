@@ -188,6 +188,10 @@ home-dashboard/
 | POST | `/api/cameras/restart-all` | Restart semua stream |
 | GET | `/api/stream-status` | Status online/offline tiap channel |
 | GET | `/api/nvr-events` | Event NVR real-time (motion, SMD) |
+| GET/POST | `/api/mode` | Home/away mode (away = alarm aktif) |
+| GET/POST | `/api/nvr-guard` | NVR arm/disarm status |
+| POST | `/api/siren` | Trigger siren kamera (DH-P5AE-PV) |
+| POST | `/api/siren/stop` | Stop siren kamera |
 | GET/POST | `/api/zones` | Zona perimeter |
 | DELETE/PATCH | `/api/zones/:id` | Edit/hapus zona |
 | GET/POST | `/api/faces` | Wajah terdaftar |

@@ -329,7 +329,7 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
             log.info(f"[{channel_id}] FaceRecognized: {person_name} ({face_conf:.2f})")
             _post_event(channel_id, camera_name, "FaceRecognized",
                         person_name=person_name, confidence=face_conf)
-        elif person_identified and person_name is None and face_conf > 0 and face_conf < FACE_THRESH:
+        elif person_identified and person_name is None and 0 < face_conf < FACE_THRESH:
             # face detected but unrecognised
             if not _cooling(channel_id, f"face_unknown_{int(cx_norm*8)}_{int(cy_norm*8)}"):
                 log.info(f"[{channel_id}] UnknownFace sim={face_conf:.2f}")
@@ -365,7 +365,7 @@ def channel_worker(camera_id: int, camera_name: str, channel_id: str):
                 mode = _get_mode()
 
                 # Always save snapshot periodically (lightweight, for UI zone editor)
-                if frame_count % SNAPSHOT_EVERY == 0:
+                if frame_count % SNAPSHOT_EVERY == 0 and not (mode == "away" and frame_count % PROCESS_EVERY == 0):
                     cv2.imwrite(snap_path, frame)
 
                 # AI processing only when mode=away and at PROCESS_EVERY cadence

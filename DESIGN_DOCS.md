@@ -27,6 +27,10 @@
 10. [Rekomendasi Prioritas](#10-rekomendasi-prioritas)
 11. [Roadmap Pengembangan](#11-roadmap-pengembangan)
 12. [Dahua NVR — Device Info & Kapabilitas API](#12-dahua-nvr--device-info--kapabilitas-api)
+13. [Integrasi Kamera DH-P5AE-PV (Siren/Speaker)](#13-integrasi-kamera-dh-p5ae-pv-sirenspeaker)
+14. [NVR Guard Mode (Arm/Disarm)](#14-nvr-guard-mode-armdisarm)
+15. [Optimasi MediaMTX — On-Demand Streaming](#15-optimasi-mediamtx--on-demand-streaming)
+16. [Optimasi Analyzer — Mode-Aware On-Demand AI](#16-optimasi-analyzer--mode-aware-on-demand-ai)
 
 ---
 
@@ -1316,5 +1320,217 @@ Credentials juga bisa diset via environment variables: `DVR_HOST`, `DVR_USER`, `
 
 ---
 
-*Dokumen ini diperbarui pada 23 Mei 2026 berdasarkan audit kode dan eksplorasi API NVR secara langsung.*  
+## 13. Integrasi Kamera DH-P5AE-PV (Siren/Speaker)
+
+> Ditambahkan: 31 Mei 2026
+
+### 13.1 Kapabilitas Kamera
+
+Dahua DH-P5AE-PV adalah kamera WiFi PT 5MP dengan fitur:
+
+| Fitur | Spesifikasi |
+|---|---|
+| **Two-Way Audio** | Built-in mic + speaker |
+| **Siren/Active Deterrence** | 1 preset + up to 10 custom sound alarm |
+| **Smart Motion (SMD 3.0)** | Human & Vehicle detection |
+| **IVS** | Tripwire, Intrusion, Linkage Tracking |
+| **Pan/Tilt** | 0°–345° pan, 0°–80° tilt, 300 preset |
+| **Konektivitas** | WiFi 802.11b/g/n (2.4 GHz) + RJ-45 |
+| **ONVIF** | Device, Events, Media, PTZ |
+
+### 13.2 Audio Output / Siren API
+
+Integrasi menggunakan Dahua CGI HTTP API via Digest Auth:
+
+```bash
+# Trigger siren (coaxial control)
+curl --digest -u user:pass \
+  "http://<CAMERA-IP>/cgi-bin/coaxialControl.cgi?action=control&channel=1&info[0].Type=Speaker"
+
+# Trigger alarm
+curl --digest -u user:pass \
+  "http://<CAMERA-IP>/cgi-bin/alarm.cgi?action=start&channel=1"
+
+# Stop alarm
+curl --digest -u user:pass \
+  "http://<CAMERA-IP>/cgi-bin/alarm.cgi?action=stop&channel=1"
+```
+
+### 13.3 Integrasi di Dashboard
+
+**Alur otomatis:**
+```
+Analyzer detect person (mode=away)
+  → POST /api/analyzer-event
+    → Backend _trigger_alarm()
+      → HTTP CGI ke kamera DH-P5AE-PV
+        → Speaker kamera bunyi siren
+```
+
+**Alur manual (API):**
+
+| Method | Path | Body | Keterangan |
+|---|---|---|---|
+| POST | `/api/siren` | `{"channel": 1}` | Trigger siren |
+| POST | `/api/siren/stop` | `{"channel": 1}` | Stop siren |
+
+### 13.4 Konfigurasi
+
+Environment variables di `docker-compose.yml` (service `backend`):
+
+| Variable | Default | Keterangan |
+|---|---|---|
+| `SIREN_CAMERA_HOST` | (kosong) | IP kamera dengan speaker (DH-P5AE-PV) |
+| `SIREN_CAMERA_USER` | fallback DVR_USER | Username kamera |
+| `SIREN_CAMERA_PASS` | fallback DVR_PASS | Password kamera |
+| `SIREN_ENABLED` | `true` | Enable/disable siren trigger |
+
+---
+
+## 14. NVR Guard Mode (Arm/Disarm)
+
+> Ditambahkan: 31 Mei 2026
+
+### 14.1 Mekanisme
+
+NVR DHI-NVR4108HS-4KS3 mendukung guard mode via CGI API. Guard mode mengontrol apakah NVR akan memproses dan merekam alarm events.
+
+### 14.2 API Endpoints
+
+| Method | Path | Body | Keterangan |
+|---|---|---|---|
+| GET | `/api/nvr-guard` | — | Get current armed/disarmed status |
+| POST | `/api/nvr-guard` | `{"armed": true}` | Set arm/disarm |
+
+### 14.3 Sinkronisasi dengan Mode Home/Away
+
+Ketika user mengganti mode via `POST /api/mode`:
+- **mode=away** → NVR otomatis di-arm (background thread)
+- **mode=home** → NVR otomatis di-disarm (background thread)
+
+Sinkronisasi berjalan asinkron (non-blocking) agar tidak memperlambat UI response.
+
+### 14.4 CGI Endpoints yang Digunakan
+
+```bash
+# Arm
+GET /cgi-bin/configManager.cgi?action=setConfig&Alarm_ARM=Start
+
+# Disarm
+GET /cgi-bin/configManager.cgi?action=setConfig&Alarm_ARM=Stop
+
+# Get status
+GET /cgi-bin/configManager.cgi?action=getConfig&name=Alarm_ARM
+```
+
+**Catatan:** Membutuhkan user dengan hak **Config** dan **Alarm** di NVR. User `dashboard` (hak terbatas) kemungkinan mendapat 403. Gunakan `DVR_EVENT_USER` / `DVR_EVENT_PASS` dengan akun yang memiliki privilege lebih tinggi.
+
+---
+
+## 15. Optimasi MediaMTX — On-Demand Streaming
+
+> Ditambahkan: 31 Mei 2026
+
+### 15.1 Perubahan dari Always-On ke On-Demand
+
+**Sebelumnya (v1):**
+```yaml
+paths:
+  ch1:
+    runOnInit: /app/start_stream.sh 1
+    runOnInitRestart: yes
+```
+- ffmpeg berjalan terus 24/7 untuk semua channel
+- CPU + bandwidth terpakai meskipun tidak ada viewer
+- ~3000kbps × 4 channel = ~12 Mbps konstan dari NVR
+
+**Sekarang (v2):**
+```yaml
+paths:
+  ch1:
+    runOnDemand: /app/start_stream.sh 1
+    runOnDemandRestart: yes
+    runOnDemandStartTimeout: 15s
+    runOnDemandCloseAfter: 30s
+```
+- ffmpeg hanya start ketika ada viewer yang request stream
+- Otomatis stop 30 detik setelah viewer terakhir disconnect
+- Startup time ~5–10 detik (negoisasi RTSP + HLS segment pertama)
+
+### 15.2 Dampak
+
+| Aspek | Sebelum | Sesudah |
+|---|---|---|
+| CPU idle | ~20–30% (4× ffmpeg) | ~2% (mediamtx saja) |
+| Bandwidth NVR | 12 Mbps konstan | 0 saat idle, 3 Mbps per viewer |
+| Startup latency | 0 (sudah jalan) | 5–10 detik (first viewer) |
+| Recovery | Auto-restart | Auto-restart + on-demand |
+
+### 15.3 Catatan
+
+- Analyzer service tetap bisa trigger stream on-demand karena RTSP read ke mediamtx dihitung sebagai "viewer"
+- `runOnDemandCloseAfter: 30s` memberi buffer agar stream tidak stop/start terus jika user berpindah halaman sebentar
+- Custom streams (`~^custom_[0-9a-f]+$`) tidak terpengaruh (tetap publisher-push)
+
+---
+
+## 16. Optimasi Analyzer — Mode-Aware On-Demand AI
+
+> Ditambahkan: 31 Mei 2026
+
+### 16.1 Arsitektur Baru
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 Analyzer Service                      │
+│                                                      │
+│  mode=home:                                          │
+│    • Snapshot only (setiap 30 frame)                 │
+│    • Tanpa AI inference                              │
+│    • Model belum di-load (lazy init)                 │
+│    • CPU usage: minimal                              │
+│                                                      │
+│  mode=away:                                          │
+│    • Full AI processing (YOLO + InsightFace)         │
+│    • Snapshot + inference setiap 8 frame             │
+│    • Zone intrusion + face recognition aktif         │
+│    • Alarm trigger ke siren kamera                   │
+│                                                      │
+│  Mode check: polling /api/mode setiap 30s            │
+└─────────────────────────────────────────────────────┘
+```
+
+### 16.2 Perubahan Kunci
+
+| Optimasi | Sebelum | Sesudah | Dampak |
+|---|---|---|---|
+| **Model loading** | Startup (blocking ~30s) | Lazy on first `mode=away` | Container start instant |
+| **AI inference** | Selalu aktif | Hanya saat `mode=away` | ~90% CPU savings saat home |
+| **Face detection** | 2× per person (zone + face) | 1× per person (cached) | ~50% face inference saved |
+| **HTTP calls** | New connection per request | `requests.Session` pooling | ~100ms/request saved |
+| **Snapshot saving** | Setiap 8 frame (selalu) | Setiap 30 frame (home), 8 frame (away) | Less disk I/O |
+| **DB refresh** | Setiap 30s (selalu) | Setiap 30s hanya saat away | Less backend load |
+
+### 16.3 Resource Usage (Estimasi 4 Channel)
+
+| Mode | CPU | Memory | Network |
+|---|---|---|---|
+| **Home** | ~5% (RTSP read + snapshot) | ~100MB (no models) | Minimal |
+| **Away** | ~30–50% (YOLO + face) | ~450MB (models loaded) | Moderate (events) |
+
+### 16.4 Alur Mode Transition
+
+```
+User toggle → POST /api/mode {mode: "away"}
+  → Backend saves mode + arms NVR (background)
+  → Analyzer polls mode (next 30s cycle)
+    → Detects mode=away
+    → Loads models if not yet loaded (lazy)
+    → Starts AI inference on next frame cycle
+    → Detects person → triggers siren on camera
+```
+
+---
+
+*Dokumen ini diperbarui pada 31 Mei 2026 dengan integrasi DH-P5AE-PV, NVR guard mode, on-demand streaming, dan optimasi analyzer.*  
 *Perbarui dokumen ini setiap kali ada perubahan arsitektur signifikan.*
