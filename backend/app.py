@@ -94,6 +94,12 @@ DVR_PASS      = os.getenv("DVR_PASS", "d4$hb0ard-dlt")
 DVR_EVENT_USER = os.getenv("DVR_EVENT_USER") or DVR_USER
 DVR_EVENT_PASS = os.getenv("DVR_EVENT_PASS") or DVR_PASS
 
+# ── Camera Siren/Audio Config (DH-P5AE-PV or similar with speaker) ──────────
+SIREN_CAMERA_HOST = os.getenv("SIREN_CAMERA_HOST", "")  # IP of camera with speaker
+SIREN_CAMERA_USER = os.getenv("SIREN_CAMERA_USER", "") or DVR_USER
+SIREN_CAMERA_PASS = os.getenv("SIREN_CAMERA_PASS", "") or DVR_PASS
+SIREN_ENABLED     = os.getenv("SIREN_ENABLED", "true").lower() in ("1", "true", "yes")
+
 _nvr_events = collections.deque(maxlen=30)
 _nvr_status = {"connected": False, "error": None, "last_event": None}
 _nvr_lock   = threading.Lock()
@@ -1080,9 +1086,118 @@ def _get_current_mode(db):
     return row['value'] if row else 'home'
 
 
+def _get_siren_config():
+    """Get current siren configuration from DB with env fallback."""
+    host = _db_setting('siren_host', SIREN_CAMERA_HOST)
+    user = _db_setting('siren_user', SIREN_CAMERA_USER) or DVR_USER
+    passwd = _db_setting('siren_pass', SIREN_CAMERA_PASS) or DVR_PASS
+    enabled = _db_setting('siren_enabled', 'true' if SIREN_ENABLED else 'false') == 'true'
+    return host, user, passwd, enabled
+
+
+def _trigger_siren(channel: int = 1):
+    """Trigger siren/speaker on camera (DH-P5AE-PV or similar Dahua with built-in speaker).
+    Uses coaxialControl CGI for alarm output and audioOutput for tone playback.
+    """
+    host, user, passwd, enabled = _get_siren_config()
+    if not host or not enabled:
+        print("[SIREN] Skipped — SIREN_CAMERA_HOST not configured or disabled", flush=True)
+        return False
+
+    endpoints = [
+        # Primary: coaxial alarm (works on most Dahua cameras with speaker)
+        f"/cgi-bin/coaxialControl.cgi?action=control&channel={channel}&info[0].Type=Speaker",
+        # Fallback: direct alarm trigger
+        f"/cgi-bin/alarm.cgi?action=start&channel={channel}",
+    ]
+
+    for path in endpoints:
+        try:
+            resp = requests.get(
+                f"http://{host}{path}",
+                auth=HTTPDigestAuth(user, passwd),
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                print(f"[SIREN] Triggered OK via {path}", flush=True)
+                return True
+            print(f"[SIREN] {path} → HTTP {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"[SIREN] {path} error: {e}", flush=True)
+
+    return False
+
+
+def _stop_siren(channel: int = 1):
+    """Stop siren/speaker on camera."""
+    host, user, passwd, enabled = _get_siren_config()
+    if not host:
+        return False
+    try:
+        resp = requests.get(
+            f"http://{host}/cgi-bin/alarm.cgi?action=stop&channel={channel}",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[SIREN] stop error: {e}", flush=True)
+        return False
+
+
+def _nvr_guard_set(armed: bool) -> dict:
+    """Set NVR guard mode (arm/disarm).
+    Tries multiple CGI endpoints since Dahua firmware varies.
+    """
+    user, passwd = _get_nvr_event_creds()
+    mode_str = "Start" if armed else "Stop"
+
+    endpoints = [
+        # Primary: configManager approach
+        f"/cgi-bin/configManager.cgi?action=setConfig&Alarm_ARM={mode_str}",
+        # Alternate: SecurityManager
+        f"/cgi-bin/SecurityManager.cgi?action={'arm' if armed else 'disarm'}",
+    ]
+
+    for path in endpoints:
+        try:
+            resp = requests.get(
+                f"http://{DVR_HOST}:{DVR_HTTP_PORT}{path}",
+                auth=HTTPDigestAuth(user, passwd),
+                timeout=8,
+            )
+            if resp.status_code == 200 and "OK" in resp.text:
+                print(f"[NVR-GUARD] {'Armed' if armed else 'Disarmed'} OK via {path}", flush=True)
+                return {"ok": True, "armed": armed}
+            print(f"[NVR-GUARD] {path} → HTTP {resp.status_code}: {resp.text[:100]}", flush=True)
+        except Exception as e:
+            print(f"[NVR-GUARD] {path} error: {e}", flush=True)
+
+    return {"ok": False, "error": "All endpoints failed", "armed": None}
+
+
+def _nvr_guard_get() -> dict:
+    """Get current NVR guard/arm status."""
+    user, passwd = _get_nvr_event_creds()
+    try:
+        resp = requests.get(
+            f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/configManager.cgi?action=getConfig&name=Alarm_ARM",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            body = resp.text.strip()
+            armed = "Start" in body or "true" in body.lower()
+            return {"ok": True, "armed": armed, "raw": body[:200]}
+        return {"ok": False, "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        print(f"[NVR-GUARD] get error: {e}", flush=True)
+        return {"ok": False, "error": "NVR connection failed"}
+
+
 def _trigger_alarm(event_body):
-    """Called when mode=away and a human detection event arrives.
-    Extend this function to send webhooks, trigger a siren, etc.
+    """Called when alarm condition is met.
+    Triggers siren on camera speaker + logs alarm.
     """
     print(
         f"[ALARM] TRIGGERED – event={event_body.get('event_type')}"
@@ -1091,7 +1206,56 @@ def _trigger_alarm(event_body):
         f", zone={event_body.get('zone_name')}",
         flush=True,
     )
-    # TODO: send webhook / push notification / siren
+    # Trigger camera siren in background thread to not block request
+    threading.Thread(target=_trigger_siren, daemon=True).start()
+
+
+def _check_zone_alarm(event_body, current_mode, db):
+    """Check per-zone alarm settings to determine if alarm or chime should trigger.
+    Returns: 'alarm', 'chime', or None
+    """
+    zone_name = event_body.get('zone_name')
+    if not zone_name:
+        # Fallback to global logic
+        event_type = event_body.get('event_type', 'Unknown')
+        if current_mode == 'away' and event_type in ALARM_EVENT_TYPES:
+            return 'alarm'
+        return None
+
+    # Find zone by name
+    row = db.execute("SELECT id FROM zones WHERE name=?", (zone_name,)).fetchone()
+    if not row:
+        # Zone not found, fallback
+        event_type = event_body.get('event_type', 'Unknown')
+        if current_mode == 'away' and event_type in ALARM_EVENT_TYPES:
+            return 'alarm'
+        return None
+
+    zone_id = row['id']
+    settings_raw = _db_setting(f'zone_{zone_id}_alarm', '')
+    if settings_raw:
+        try:
+            settings = json.loads(settings_raw)
+        except Exception:
+            settings = {}
+    else:
+        settings = {}
+
+    trigger_on_home = settings.get('trigger_on_home', False)
+    trigger_on_away = settings.get('trigger_on_away', True)
+    chime_on_home = settings.get('chime_on_home', True)
+
+    event_type = event_body.get('event_type', 'Unknown')
+    if event_type not in ALARM_EVENT_TYPES:
+        return None
+
+    if current_mode == 'away' and trigger_on_away:
+        return 'alarm'
+    if current_mode == 'home' and trigger_on_home:
+        return 'alarm'
+    if current_mode == 'home' and chime_on_home:
+        return 'chime'
+    return None
 
 
 @app.route('/api/mode', methods=['GET'])
@@ -1110,7 +1274,54 @@ def update_mode():
     db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('mode', ?)", (mode,))
     db.commit()
     print(f"[MODE] Changed to '{mode}'", flush=True)
+
+    # Sync NVR guard mode with home/away in background
+    def _sync_nvr():
+        result = _nvr_guard_set(armed=(mode == 'away'))
+        if not result.get('ok'):
+            print(f"[MODE] NVR guard sync failed: {result.get('error')}", flush=True)
+    threading.Thread(target=_sync_nvr, daemon=True).start()
+
     return jsonify({'mode': mode})
+
+
+# ── NVR Guard (Arm/Disarm) ────────────────────────────────────────────────────
+
+@app.route('/api/nvr-guard', methods=['GET'])
+def get_nvr_guard():
+    """Get current NVR armed/disarmed status."""
+    result = _nvr_guard_get()
+    return jsonify(result)
+
+
+@app.route('/api/nvr-guard', methods=['POST'])
+def set_nvr_guard():
+    """Set NVR armed/disarmed status. Body: {"armed": true/false}"""
+    body = request.get_json(silent=True) or {}
+    armed = body.get('armed', True)
+    result = _nvr_guard_set(armed=armed)
+    status_code = 200 if result.get('ok') else 502
+    return jsonify(result), status_code
+
+
+# ── Siren/Speaker Control ─────────────────────────────────────────────────────
+
+@app.route('/api/siren', methods=['POST'])
+def trigger_siren_endpoint():
+    """Trigger siren on camera speaker. Body: {"channel": 1}"""
+    body = request.get_json(silent=True) or {}
+    channel = body.get('channel', 1)
+    ok = _trigger_siren(channel=channel)
+    return jsonify({'ok': ok})
+
+
+@app.route('/api/siren/stop', methods=['POST'])
+def stop_siren_endpoint():
+    """Stop siren on camera speaker."""
+    body = request.get_json(silent=True) or {}
+    channel = body.get('channel', 1)
+    ok = _stop_siren(channel=channel)
+    return jsonify({'ok': ok})
 
 
 # ── Analyzer Events (intake + read) ──────────────────────────────────────────
@@ -1121,10 +1332,13 @@ def receive_analyzer_event():
     ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     db = get_db()
 
-    # Check alarm condition: mode=away + human detection event
+    # Check alarm condition using per-zone settings
     current_mode = _get_current_mode(db)
     event_type   = body.get('event_type', 'Unknown')
-    alarm        = 1 if (current_mode == 'away' and event_type in ALARM_EVENT_TYPES) else 0
+
+    # Per-zone alarm logic
+    zone_result = _check_zone_alarm(body, current_mode, db)
+    alarm = 1 if zone_result == 'alarm' else 0
 
     db.execute(
         """INSERT INTO detection_events
@@ -1144,8 +1358,11 @@ def receive_analyzer_event():
     )
     db.commit()
 
-    if alarm:
+    if zone_result == 'alarm':
         _trigger_alarm(body)
+    elif zone_result == 'chime':
+        print(f"[CHIME] Zone '{body.get('zone_name')}' triggered chime (home mode)", flush=True)
+        # Chime uses a softer trigger (same endpoint, but logged differently)
 
     # Also push into in-memory NVR event deque so NVREventLog picks it up live
     event = {
@@ -1157,6 +1374,7 @@ def receive_analyzer_event():
         'person':         body.get('person_name'),
         'channel':        body.get('channel_id', ''),
         'alarm':          bool(alarm),
+        'chime':          zone_result == 'chime',
     }
     with _nvr_lock:
         _nvr_events.appendleft(event)
@@ -1203,10 +1421,477 @@ def camera_snapshot(cam_id):
     return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache'}
 
 
+# ── Siren Config CRUD ─────────────────────────────────────────────────────────
+
+@app.route('/api/siren-config', methods=['GET'])
+def get_siren_config():
+    """Get siren configuration from DB settings."""
+    return jsonify({
+        'host': _db_setting('siren_host', SIREN_CAMERA_HOST),
+        'user': _db_setting('siren_user', SIREN_CAMERA_USER),
+        'pass': _db_setting('siren_pass', SIREN_CAMERA_PASS),
+        'enabled': _db_setting('siren_enabled', 'true' if SIREN_ENABLED else 'false') == 'true',
+    })
+
+
+@app.route('/api/siren-config', methods=['POST'])
+def set_siren_config():
+    """Save siren configuration to DB settings."""
+    body = request.get_json(silent=True) or {}
+    if 'host' in body:
+        _set_db_setting('siren_host', (body['host'] or '').strip())
+    if 'user' in body:
+        _set_db_setting('siren_user', (body['user'] or '').strip())
+    if 'pass' in body:
+        _set_db_setting('siren_pass', body['pass'])
+    if 'enabled' in body:
+        _set_db_setting('siren_enabled', 'true' if body['enabled'] else 'false')
+
+    # Update runtime globals
+    global SIREN_CAMERA_HOST, SIREN_CAMERA_USER, SIREN_CAMERA_PASS, SIREN_ENABLED
+    SIREN_CAMERA_HOST = _db_setting('siren_host', '')
+    SIREN_CAMERA_USER = _db_setting('siren_user', '') or DVR_USER
+    SIREN_CAMERA_PASS = _db_setting('siren_pass', '') or DVR_PASS
+    SIREN_ENABLED = _db_setting('siren_enabled', 'true') == 'true'
+
+    return jsonify({'ok': True})
+
+
+# ── Zone Alarm Settings ───────────────────────────────────────────────────────
+
+@app.route('/api/zones/<int:zone_id>/alarm-settings', methods=['GET'])
+def get_zone_alarm_settings(zone_id):
+    """Get alarm settings for a zone."""
+    db = get_db()
+    if not db.execute("SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        return jsonify({'error': 'not found'}), 404
+    settings_raw = _db_setting(f'zone_{zone_id}_alarm', '')
+    if settings_raw:
+        try:
+            return jsonify(json.loads(settings_raw))
+        except Exception:
+            pass
+    # Default settings
+    return jsonify({
+        'trigger_on_home': False,
+        'trigger_on_away': True,
+        'sound_file': 'alarm',
+        'chime_on_home': True,
+    })
+
+
+@app.route('/api/zones/<int:zone_id>/alarm-settings', methods=['POST'])
+def set_zone_alarm_settings(zone_id):
+    """Set alarm settings for a zone."""
+    db = get_db()
+    if not db.execute("SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    settings = {
+        'trigger_on_home': bool(body.get('trigger_on_home', False)),
+        'trigger_on_away': bool(body.get('trigger_on_away', True)),
+        'sound_file': (body.get('sound_file') or 'alarm').strip(),
+        'chime_on_home': bool(body.get('chime_on_home', True)),
+    }
+    _set_db_setting(f'zone_{zone_id}_alarm', json.dumps(settings))
+    return jsonify(settings)
+
+
+# ── Sound Files Management ────────────────────────────────────────────────────
+
+SOUND_DIR = os.getenv("SOUND_DIR", "/data/sounds")
+
+
+@app.route('/api/sounds', methods=['GET'])
+def list_sounds():
+    """List available sound files."""
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    files = []
+    for fname in sorted(os.listdir(SOUND_DIR)):
+        if fname.lower().endswith(('.mp3', '.wav', '.ogg')):
+            files.append({'name': os.path.splitext(fname)[0], 'filename': fname})
+    # Always include built-in options
+    builtins = [
+        {'name': 'alarm', 'filename': '__builtin_alarm', 'builtin': True},
+        {'name': 'chime', 'filename': '__builtin_chime', 'builtin': True},
+    ]
+    return jsonify(builtins + files)
+
+
+@app.route('/api/sounds', methods=['POST'])
+def upload_sound():
+    """Upload a custom sound file."""
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({'error': 'Empty filename'}), 400
+    # Sanitize filename using werkzeug secure_filename + additional restrictions
+    from werkzeug.utils import secure_filename as _secure_filename
+    safe_name = _secure_filename(f.filename)
+    if not safe_name or not safe_name.lower().endswith(('.mp3', '.wav', '.ogg')):
+        return jsonify({'error': 'Only .mp3, .wav, .ogg files allowed'}), 400
+    filepath = os.path.join(SOUND_DIR, safe_name)
+    f.save(filepath)
+    return jsonify({'ok': True, 'name': os.path.splitext(safe_name)[0], 'filename': safe_name}), 201
+
+
+@app.route('/api/sounds/<filename>', methods=['DELETE'])
+def delete_sound(filename):
+    """Delete a custom sound file."""
+    if filename.startswith('__builtin'):
+        return jsonify({'error': 'Cannot delete built-in sounds'}), 400
+    # Sanitize filename using werkzeug secure_filename
+    from werkzeug.utils import secure_filename as _secure_filename
+    safe_name = _secure_filename(filename)
+    if not safe_name:
+        return jsonify({'error': 'Invalid filename'}), 400
+    filepath = os.path.join(SOUND_DIR, safe_name)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    return '', 204
+
+
+# ── Performance Monitoring ────────────────────────────────────────────────────
+
+_perf_lock = threading.Lock()
+_perf_prev_cpu = None
+
+
+@app.route('/api/performance', methods=['GET'])
+def get_performance():
+    """Get server and NVR performance metrics."""
+    global _perf_prev_cpu
+    import platform
+
+    # Server metrics
+    server_metrics = {
+        'hostname': platform.node(),
+        'platform': platform.system(),
+    }
+
+    # CPU usage (simple /proc/stat parse or fallback)
+    try:
+        with open('/proc/stat', 'r') as f:
+            line = f.readline()
+        parts = line.split()
+        idle = int(parts[4])
+        total = sum(int(p) for p in parts[1:])
+        # Store for delta calculation (thread-safe)
+        with _perf_lock:
+            if _perf_prev_cpu is None:
+                _perf_prev_cpu = (idle, total)
+                cpu_percent = 0.0
+            else:
+                prev_idle, prev_total = _perf_prev_cpu
+                d_idle = idle - prev_idle
+                d_total = total - prev_total
+                cpu_percent = round((1.0 - d_idle / max(d_total, 1)) * 100, 1)
+                _perf_prev_cpu = (idle, total)
+        server_metrics['cpu_percent'] = cpu_percent
+    except Exception:
+        server_metrics['cpu_percent'] = None
+
+    # Memory usage
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            mem = {}
+            for line in f:
+                parts = line.split()
+                if parts[0].rstrip(':') in ('MemTotal', 'MemAvailable', 'MemFree'):
+                    mem[parts[0].rstrip(':')] = int(parts[1]) * 1024  # kB to bytes
+        total_mem = mem.get('MemTotal', 0)
+        avail_mem = mem.get('MemAvailable', mem.get('MemFree', 0))
+        used_mem = total_mem - avail_mem
+        server_metrics['mem_total'] = total_mem
+        server_metrics['mem_used'] = used_mem
+        server_metrics['mem_percent'] = round(used_mem / max(total_mem, 1) * 100, 1)
+    except Exception:
+        server_metrics['mem_total'] = None
+        server_metrics['mem_used'] = None
+        server_metrics['mem_percent'] = None
+
+    # Disk usage (data volume)
+    try:
+        st = os.statvfs('/data')
+        total_disk = st.f_blocks * st.f_frsize
+        free_disk = st.f_bavail * st.f_frsize
+        used_disk = total_disk - free_disk
+        server_metrics['disk_total'] = total_disk
+        server_metrics['disk_used'] = used_disk
+        server_metrics['disk_percent'] = round(used_disk / max(total_disk, 1) * 100, 1)
+    except Exception:
+        server_metrics['disk_total'] = None
+        server_metrics['disk_used'] = None
+        server_metrics['disk_percent'] = None
+
+    # Uptime
+    try:
+        with open('/proc/uptime', 'r') as f:
+            uptime_secs = float(f.read().split()[0])
+        server_metrics['uptime_seconds'] = int(uptime_secs)
+    except Exception:
+        server_metrics['uptime_seconds'] = None
+
+    # NVR metrics (from NVR API)
+    nvr_metrics = {'reachable': False}
+    try:
+        user, passwd = _get_nvr_event_creds()
+        resp = requests.get(
+            f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/magicBox.cgi?action=getMemoryInfo",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            nvr_metrics['reachable'] = True
+            kv = _parse_dahua_kv_text(resp.text)
+            nvr_metrics['mem_total'] = int(kv.get('status.Total', 0))
+            nvr_metrics['mem_used'] = int(kv.get('status.Used', 0))
+
+        # CPU
+        resp2 = requests.get(
+            f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/magicBox.cgi?action=getCPUUsage",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=5,
+        )
+        if resp2.status_code == 200:
+            kv2 = _parse_dahua_kv_text(resp2.text)
+            nvr_metrics['cpu_percent'] = float(kv2.get('status.CPUUsage', kv2.get('usage', 0)))
+    except Exception as e:
+        nvr_metrics['error'] = str(e)
+
+    return jsonify({
+        'server': server_metrics,
+        'nvr': nvr_metrics,
+    })
+
+
+# ── Smart Door Lock (Paloma DLP6202 via Tuya) ─────────────────────────────────
+
+from doorlock import doorlock as _doorlock_instance
+
+# Door lock config keys in settings table
+_DOORLOCK_KEYS = ('doorlock_access_id', 'doorlock_access_secret',
+                  'doorlock_device_id', 'doorlock_region', 'doorlock_uid')
+
+
+def _get_doorlock_config():
+    """Read doorlock configuration from DB."""
+    return {
+        'access_id': _db_setting('doorlock_access_id', ''),
+        'access_secret': _db_setting('doorlock_access_secret', ''),
+        'device_id': _db_setting('doorlock_device_id', ''),
+        'region': _db_setting('doorlock_region', 'us'),
+        'uid': _db_setting('doorlock_uid', ''),
+    }
+
+
+def _init_doorlock():
+    """Try to initialize doorlock connection from saved config."""
+    cfg = _get_doorlock_config()
+    if cfg.get('access_id') and cfg.get('access_secret') and cfg.get('device_id'):
+        try:
+            _doorlock_instance.configure(cfg)
+        except Exception as e:
+            print(f"[DOORLOCK] Init failed: {e}", flush=True)
+
+
+def _doorlock_safe_error(e):
+    """Return a safe error message without exposing internal stack traces."""
+    msg = str(e)
+    # Only return the first line (message), not full traceback
+    first_line = msg.split('\n')[0]
+    # Strip file paths and internal details
+    if 'Traceback' in first_line or 'File "' in first_line:
+        return 'Internal error'
+    return first_line[:120]
+
+
+@app.route('/api/doorlock/config', methods=['GET'])
+def get_doorlock_config():
+    """Get doorlock configuration (secrets masked)."""
+    cfg = _get_doorlock_config()
+    return jsonify({
+        'access_id': cfg['access_id'],
+        'access_secret': '••••' + cfg['access_secret'][-4:] if len(cfg['access_secret']) > 4 else '',
+        'device_id': cfg['device_id'],
+        'region': cfg['region'],
+        'uid': cfg['uid'],
+        'connected': _doorlock_instance.connected,
+        'error': _doorlock_instance.last_error,
+    })
+
+
+@app.route('/api/doorlock/config', methods=['POST'])
+def set_doorlock_config():
+    """Save doorlock configuration and attempt connection."""
+    body = request.get_json(silent=True) or {}
+
+    if 'access_id' in body:
+        _set_db_setting('doorlock_access_id', (body['access_id'] or '').strip())
+    if 'access_secret' in body:
+        val = (body['access_secret'] or '').strip()
+        # Don't overwrite with masked value
+        if val and not val.startswith('••••'):
+            _set_db_setting('doorlock_access_secret', val)
+    if 'device_id' in body:
+        _set_db_setting('doorlock_device_id', (body['device_id'] or '').strip())
+    if 'region' in body:
+        _set_db_setting('doorlock_region', (body['region'] or 'us').strip().lower())
+    if 'uid' in body:
+        _set_db_setting('doorlock_uid', (body['uid'] or '').strip())
+
+    # Reconnect with new config
+    cfg = _get_doorlock_config()
+    ok = _doorlock_instance.configure(cfg)
+
+    return jsonify({
+        'ok': ok,
+        'connected': _doorlock_instance.connected,
+        'error': _doorlock_instance.last_error,
+    })
+
+
+@app.route('/api/doorlock/status', methods=['GET'])
+def get_doorlock_status():
+    """Get current door lock status (battery, lock state, etc.)."""
+    if not _doorlock_instance.connected:
+        return jsonify({
+            'ok': False,
+            'connected': False,
+            'error': _doorlock_instance.last_error or 'Not connected',
+        })
+
+    try:
+        status = _doorlock_instance.get_device_status()
+        return jsonify({'ok': True, 'connected': True, 'status': status})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/unlock', methods=['POST'])
+def doorlock_unlock():
+    """Send remote unlock command to door lock."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.unlock()
+        return jsonify({'ok': True, 'message': 'Unlock command sent'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/lock', methods=['POST'])
+def doorlock_lock():
+    """Send remote lock command to door lock."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.lock()
+        return jsonify({'ok': True, 'message': 'Lock command sent'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/camera/stream', methods=['POST'])
+def doorlock_camera_stream():
+    """Allocate a temporary camera stream URL."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        stream_info = _doorlock_instance.get_camera_stream()
+        return jsonify({'ok': True, 'stream': stream_info})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/camera/stop', methods=['POST'])
+def doorlock_camera_stop():
+    """Stop/deallocate camera stream."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.stop_camera_stream()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/talk/start', methods=['POST'])
+def doorlock_talk_start():
+    """Start two-way audio (speak & listen) session."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        session = _doorlock_instance.start_talk()
+        return jsonify({'ok': True, 'session': session})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/talk/stop', methods=['POST'])
+def doorlock_talk_stop():
+    """Stop two-way audio session."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.stop_talk()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
+@app.route('/api/doorlock/alerts', methods=['GET'])
+def doorlock_alerts():
+    """Get door lock alerts/events."""
+    if not _doorlock_instance.connected:
+        # Return local events even if not connected
+        return jsonify({
+            'ok': True,
+            'connected': False,
+            'alerts': _doorlock_instance.get_local_events(),
+        })
+
+    try:
+        limit = int(request.args.get('limit', 20))
+        alerts = _doorlock_instance.get_alerts(limit=limit)
+        return jsonify({'ok': True, 'connected': True, 'alerts': alerts})
+    except Exception as e:
+        return jsonify({
+            'ok': True,
+            'connected': True,
+            'alerts': _doorlock_instance.get_local_events(),
+            'error': _doorlock_safe_error(e),
+        })
+
+
+@app.route('/api/doorlock/info', methods=['GET'])
+def doorlock_info():
+    """Get door lock device information."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        info = _doorlock_instance.get_device_info()
+        return jsonify({'ok': True, 'info': info})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
+
+
 _nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")
 _nvr_thread.start()
 
 init_db()
+
+# Initialize doorlock after DB is ready
+_init_doorlock()
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))

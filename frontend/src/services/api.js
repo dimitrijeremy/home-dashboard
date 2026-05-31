@@ -193,3 +193,198 @@ export async function fetchNvrInfo() {
   if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to fetch NVR info')
   return data.info
 }
+
+// ── NVR Guard (Arm/Disarm) ────────────────────────────────────────────────────
+
+export async function fetchNvrGuard() {
+  const res = await fetch(url('/api/nvr-guard'))
+  if (!res.ok) throw new Error('Failed to fetch NVR guard status')
+  return res.json()
+}
+
+export async function postNvrGuard(armed) {
+  const res = await fetch(url('/api/nvr-guard'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ armed }),
+  })
+  if (!res.ok) throw new Error('Failed to set NVR guard')
+  return res.json()
+}
+
+// ── Siren/Speaker Control ─────────────────────────────────────────────────────
+
+export async function triggerSiren(channel = 1) {
+  const res = await fetch(url('/api/siren'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel }),
+  })
+  if (!res.ok) throw new Error('Failed to trigger siren')
+  return res.json()
+}
+
+export async function stopSiren(channel = 1) {
+  const res = await fetch(url('/api/siren/stop'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel }),
+  })
+  if (!res.ok) throw new Error('Failed to stop siren')
+  return res.json()
+}
+
+// ── Siren Config ──────────────────────────────────────────────────────────────
+
+export async function fetchSirenConfig() {
+  const res = await fetch(url('/api/siren-config'))
+  if (!res.ok) throw new Error('Failed to fetch siren config')
+  return res.json()
+}
+
+export async function postSirenConfig(data) {
+  const res = await fetch(url('/api/siren-config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error('Failed to save siren config')
+  return res.json()
+}
+
+// ── Zone Alarm Settings ───────────────────────────────────────────────────────
+
+export async function fetchZoneAlarmSettings(zoneId) {
+  const res = await fetch(url(`/api/zones/${zoneId}/alarm-settings`))
+  if (!res.ok) throw new Error('Failed to fetch zone alarm settings')
+  return res.json()
+}
+
+export async function postZoneAlarmSettings(zoneId, data) {
+  const res = await fetch(url(`/api/zones/${zoneId}/alarm-settings`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error('Failed to save zone alarm settings')
+  return res.json()
+}
+
+// ── Sound Files ───────────────────────────────────────────────────────────────
+
+export async function fetchSounds() {
+  const res = await fetch(url('/api/sounds'))
+  if (!res.ok) throw new Error('Failed to fetch sounds')
+  return res.json()
+}
+
+export async function uploadSound(file) {
+  const fd = new FormData()
+  fd.append('file', file)
+  const res = await fetch(url('/api/sounds'), { method: 'POST', body: fd })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to upload sound')
+  }
+  return res.json()
+}
+
+export async function deleteSound(filename) {
+  const res = await fetch(url(`/api/sounds/${encodeURIComponent(filename)}`), { method: 'DELETE' })
+  if (!res.ok && res.status !== 204) throw new Error('Failed to delete sound')
+}
+
+// ── Performance Monitoring ────────────────────────────────────────────────────
+
+export async function fetchPerformance() {
+  const res = await fetch(url('/api/performance'))
+  if (!res.ok) throw new Error('Failed to fetch performance')
+  return res.json()
+}
+
+// ── Door Lock (Paloma DLP6202 via Tuya) ───────────────────────────────────────
+
+export async function fetchDoorlockConfig() {
+  const res = await fetch(url('/api/doorlock/config'))
+  if (!res.ok) throw new Error('Failed to fetch doorlock config')
+  return res.json()
+}
+
+export async function postDoorlockConfig(data) {
+  const res = await fetch(url('/api/doorlock/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to save doorlock config')
+  }
+  return res.json()
+}
+
+export async function fetchDoorlockStatus() {
+  const res = await fetch(url('/api/doorlock/status'))
+  if (!res.ok) throw new Error('Failed to fetch doorlock status')
+  return res.json()
+}
+
+export async function doorlockUnlock() {
+  const res = await fetch(url('/api/doorlock/unlock'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to unlock')
+  }
+  return res.json()
+}
+
+export async function doorlockLock() {
+  const res = await fetch(url('/api/doorlock/lock'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to lock')
+  }
+  return res.json()
+}
+
+export async function doorlockCameraStream() {
+  const res = await fetch(url('/api/doorlock/camera/stream'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to get camera stream')
+  }
+  return res.json()
+}
+
+export async function doorlockCameraStop() {
+  const res = await fetch(url('/api/doorlock/camera/stop'), { method: 'POST' })
+  if (!res.ok) throw new Error('Failed to stop camera stream')
+  return res.json()
+}
+
+export async function doorlockTalkStart() {
+  const res = await fetch(url('/api/doorlock/talk/start'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to start talk')
+  }
+  return res.json()
+}
+
+export async function doorlockTalkStop() {
+  const res = await fetch(url('/api/doorlock/talk/stop'), { method: 'POST' })
+  if (!res.ok) throw new Error('Failed to stop talk')
+  return res.json()
+}
+
+export async function fetchDoorlockAlerts(limit = 20) {
+  const res = await fetch(url(`/api/doorlock/alerts?limit=${limit}`))
+  if (!res.ok) throw new Error('Failed to fetch doorlock alerts')
+  return res.json()
+}
+
+export async function fetchDoorlockInfo() {
+  const res = await fetch(url('/api/doorlock/info'))
+  if (!res.ok) throw new Error('Failed to fetch doorlock info')
+  return res.json()
+}

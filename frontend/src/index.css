@@ -357,3 +357,62 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .nvr-channel-chip span{color:var(--text-muted)}
 .nvr-ok{color:#22c55e}
 .nvr-bad{color:#ef4444}
+
+/* ── Performance Monitor Widget ── */
+.perf-widget{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px}
+.perf-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.perf-title{font-size:.8rem;font-weight:600;color:var(--text-dim)}
+.perf-loading,.perf-error{font-size:.78rem;color:var(--text-muted);padding:8px 0}
+.perf-section{margin-bottom:10px}
+.perf-section:last-child{margin-bottom:0}
+.perf-section-label{font-size:.7rem;text-transform:uppercase;color:var(--text-muted);letter-spacing:.5px;margin-bottom:6px;font-weight:600}
+.perf-row{display:flex;align-items:center;gap:8px;font-size:.75rem;margin-bottom:4px}
+.perf-row span:first-child{width:36px;color:var(--text-muted);flex-shrink:0}
+.perf-val{width:52px;text-align:right;color:var(--text-dim);font-variant-numeric:tabular-nums;flex-shrink:0}
+.perf-bar-track{flex:1;height:6px;background:var(--bg);border-radius:3px;overflow:hidden}
+.perf-bar-fill{height:100%;border-radius:3px;transition:width .3s ease}
+
+/* ── Zone Alarm Settings ── */
+.zone-alarm-settings{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;margin-top:12px}
+.zone-alarm-title{font-size:.85rem;font-weight:600;margin-bottom:10px;color:var(--text)}
+.zone-alarm-row{margin-bottom:8px;font-size:.82rem;display:flex;align-items:center;gap:8px}
+.zone-alarm-row label{display:flex;align-items:center;gap:6px;cursor:pointer}
+.zone-alarm-row input[type="checkbox"]{accent-color:var(--accent)}
+.zone-alarm-select{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:var(--r-sm);font-size:.8rem}
+.zone-alarm-sounds-list{margin-top:8px;padding:8px 10px;background:rgba(255,255,255,.02);border-radius:var(--r-sm);border:1px solid var(--border)}
+.zone-alarm-sound-item{display:flex;align-items:center;justify-content:space-between;font-size:.78rem;padding:3px 0}
+
+/* ── Door Lock ── */
+.doorlock-panel{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
+.doorlock-header{font-size:.9rem;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.doorlock-status-badge{font-size:.72rem;padding:2px 8px;border-radius:12px;font-weight:500}
+.doorlock-status-badge.online{background:var(--green-glow);color:var(--green)}
+.doorlock-status-badge.offline{background:rgba(239,68,68,.15);color:var(--red)}
+.doorlock-loading,.doorlock-disconnected{font-size:.8rem;color:var(--text-muted);padding:8px 0}
+.doorlock-status-row{display:flex;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.doorlock-stat{font-size:.78rem;color:var(--text-dim);background:var(--surface);padding:4px 10px;border-radius:var(--r-sm);border:1px solid var(--border)}
+.doorlock-actions{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.doorlock-btn{font-size:.78rem!important;padding:6px 12px!important}
+.doorlock-btn.unlock{background:var(--green);color:#fff;border:none}
+.doorlock-btn.unlock:hover{background:#059669}
+.doorlock-btn.lock{background:var(--surface);border:1px solid var(--border);color:var(--text)}
+.doorlock-btn.camera{background:var(--accent);color:#fff;border:none}
+.doorlock-btn.talk{background:var(--yellow);color:#000;border:none}
+.doorlock-btn.stop,.doorlock-btn.stop-talk{background:var(--red);color:#fff;border:none}
+.doorlock-camera-section,.doorlock-talk-section{margin-bottom:8px}
+.doorlock-camera-view{position:relative}
+.doorlock-camera-view video{border:1px solid var(--border);margin-bottom:6px}
+.doorlock-msg{font-size:.78rem;padding:6px 10px;border-radius:var(--r-sm);margin-top:6px}
+.doorlock-msg.ok{background:var(--green-glow);color:var(--green)}
+.doorlock-msg.err{background:rgba(239,68,68,.12);color:var(--red)}
+.doorlock-alerts-section{margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+.doorlock-alerts-toggle{font-size:.78rem!important;color:var(--text-dim)!important}
+.doorlock-alerts-list{margin-top:6px;max-height:200px;overflow-y:auto}
+.doorlock-alert-empty{font-size:.78rem;color:var(--text-muted);padding:6px 0}
+.doorlock-alert-item{display:flex;gap:8px;align-items:center;font-size:.75rem;padding:4px 0;border-bottom:1px solid var(--border)}
+.doorlock-alert-time{color:var(--text-muted);min-width:60px}
+.doorlock-alert-type{color:var(--accent);font-weight:500}
+.doorlock-alert-detail{color:var(--text-dim);flex:1}
+.doorlock-config .nvr-cred-form select{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:var(--r-sm);font-size:.82rem;width:100%}
+.doorlock-status.online{color:var(--green);font-size:.82rem;font-weight:500}
+.doorlock-status.offline{color:var(--text-muted);font-size:.82rem}

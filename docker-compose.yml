@@ -43,6 +43,16 @@ services:
       # push stream custom ke mediamtx container via jaringan internal Docker.
       - MTX_HOST=mtx
       - RTSP_PORT=8554
+      # Camera siren/speaker (DH-P5AE-PV or similar with built-in speaker)
+      - SIREN_CAMERA_HOST=
+      - SIREN_CAMERA_USER=
+      - SIREN_CAMERA_PASS=
+      - SIREN_ENABLED=true
+      # Smart Door Lock (Paloma DLP6202 via Tuya Cloud)
+      - TUYA_ACCESS_ID=
+      - TUYA_ACCESS_SECRET=
+      - TUYA_DEVICE_ID=
+      - TUYA_REGION=us
     volumes:
       - camera_data:/data
     networks:

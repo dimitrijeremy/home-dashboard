@@ -1,20 +1,26 @@
 import React, { useEffect, useState } from 'react'
 import { fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo } from '../services/api'
 import ZoneEditor from '../features/detection/ZoneEditor'
+import ZoneAlarmSettings from '../features/detection/ZoneAlarmSettings'
 import FaceManager from '../features/detection/FaceManager'
 import EventHistory from '../features/detection/EventHistory'
+import SirenConfig from '../features/smarthome/SirenConfig'
+import DoorLockConfig from '../features/smarthome/DoorLockConfig'
 
 const TABS = [
-  { id: 'zones',   label: '📐 Zona Perimeter' },
-  { id: 'faces',   label: '👤 Wajah Dikenal' },
-  { id: 'history', label: '📋 Riwayat Deteksi' },
-  { id: 'nvr',     label: '📡 Kredensial NVR' },
+  { id: 'zones',    label: '📐 Zona Perimeter' },
+  { id: 'faces',    label: '👤 Wajah Dikenal' },
+  { id: 'history',  label: '📋 Riwayat Deteksi' },
+  { id: 'siren',    label: '🔔 Siren / Speaker' },
+  { id: 'doorlock', label: '🚪 Door Lock' },
+  { id: 'nvr',      label: '📡 Kredensial NVR' },
 ]
 
 export default function ConfigPage({ onBack }) {
   const [tab, setTab]         = useState('zones')
   const [cams, setCams]       = useState([])
   const [selectedCam, setSelectedCam] = useState(null)
+  const [selectedZoneForAlarm, setSelectedZoneForAlarm] = useState(null)
 
   // NVR config state
   const [streamUser, setStreamUser] = useState('')
@@ -118,6 +124,7 @@ export default function ConfigPage({ onBack }) {
           <div className="config-section">
             <div className="config-section-intro">
               Gambar zona perimeter pada tiap kamera. Deteksi akan memicu event saat ada orang memasuki zona.
+              Klik ikon ⚙ di zona untuk mengatur kapan alarm/chime berbunyi.
             </div>
             {cams.length === 0 ? (
               <p style={{ color: 'var(--text-muted)', fontSize: '.85rem' }}>Belum ada kamera terdaftar.</p>
@@ -135,7 +142,10 @@ export default function ConfigPage({ onBack }) {
                     ))}
                   </select>
                 </div>
-                {selectedCam && <ZoneEditor key={selectedCam.id} camera={selectedCam} />}
+                {selectedCam && <ZoneEditor key={selectedCam.id} camera={selectedCam} onZoneAlarmClick={setSelectedZoneForAlarm} />}
+                {selectedZoneForAlarm && (
+                  <ZoneAlarmSettings zone={selectedZoneForAlarm} />
+                )}
               </>
             )}
           </div>
@@ -156,6 +166,26 @@ export default function ConfigPage({ onBack }) {
               Riwayat semua event yang terdeteksi oleh sistem AI.
             </div>
             <EventHistory />
+          </div>
+        )}
+
+        {tab === 'siren' && (
+          <div className="config-section">
+            <div className="config-section-intro">
+              Konfigurasi siren/speaker untuk kamera yang memiliki built-in speaker (contoh: DH-P5AE-PV).
+              Siren akan berbunyi otomatis saat alarm trigger berdasarkan pengaturan zona.
+            </div>
+            <SirenConfig />
+          </div>
+        )}
+
+        {tab === 'doorlock' && (
+          <div className="config-section">
+            <div className="config-section-intro">
+              Konfigurasi smart door lock Paloma DLP6202 via Tuya Cloud.
+              Hubungkan akun Tuya IoT Platform untuk mengontrol kunci pintu, melihat kamera, dan intercom.
+            </div>
+            <DoorLockConfig />
           </div>
         )}
 
