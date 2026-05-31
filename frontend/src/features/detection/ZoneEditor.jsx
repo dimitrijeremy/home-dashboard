@@ -107,7 +107,7 @@ function ZoneCanvas({ imgSize, zones, draftPoints, onCanvasClick, selectedZoneId
   )
 }
 
-export default function ZoneEditor({ camera }) {
+export default function ZoneEditor({ camera, onZoneAlarmClick }) {
   const [zones, setZones]           = useState([])
   const [draftPoints, setDraftPoints] = useState([])
   const [draftName, setDraftName]   = useState('')
@@ -303,6 +303,15 @@ export default function ZoneEditor({ camera }) {
               >
                 {zone.enabled ? 'Aktif' : 'Nonaktif'}
               </button>
+              {onZoneAlarmClick && (
+                <button
+                  className="btn-icon"
+                  onClick={e => { e.stopPropagation(); onZoneAlarmClick(zone) }}
+                  title="Pengaturan alarm zona"
+                >
+                  ⚙
+                </button>
+              )}
               <button
                 className="btn-icon"
                 onClick={e => { e.stopPropagation(); handleDeleteZone(zone.id) }}

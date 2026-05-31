@@ -4,6 +4,7 @@ import CCTVPlayer from '../features/cctv/CCTVPlayer'
 import AddChannelModal from '../features/cctv/AddChannelModal'
 import SmartControls from '../features/smarthome/SmartControls'
 import WeatherWidget from '../features/weather/WeatherWidget'
+import PerformanceMonitor from '../features/smarthome/PerformanceMonitor'
 
 // ── Perimeter Alert Toasts ─────────────────────────────────────────────────
 const ALERT_CODES = new Set(['ZoneIntrusion', 'SmartMotionHuman', 'AlarmLocal', 'VideoMotion'])
@@ -332,6 +333,13 @@ export default function Dashboard({ onConfig }) {
                 <div className="section-title">Smart Home</div>
               </div>
               <SmartControls mode={mode} modeLoading={modeLoading} onModeChange={handleModeChange} />
+            </div>
+
+            <div className="section">
+              <div className="section-header">
+                <div className="section-title">Monitor</div>
+              </div>
+              <PerformanceMonitor />
             </div>
           </aside>
 

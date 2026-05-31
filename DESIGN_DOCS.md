@@ -44,6 +44,9 @@
 | Manajemen Kanal CCTV | ✅ Berfungsi | Tambah/hapus via REST API |
 | Widget Cuaca Real-time | ✅ Berfungsi | Open-Meteo API, hardcoded Jakarta |
 | Smart Home Controls | ⚠ UI-only | Tidak terhubung device fisik |
+| Integrasi Siren/Speaker | ✅ Berfungsi | DH-P5AE-PV, config via UI |
+| Alarm Per-Zona | ✅ Berfungsi | Home/away trigger + chime |
+| Performance Monitoring | ✅ Berfungsi | Server + NVR metrics |
 | Otentikasi Pengguna | ❌ Tidak ada | Risiko keamanan tinggi |
 
 ---
@@ -1322,7 +1325,8 @@ Credentials juga bisa diset via environment variables: `DVR_HOST`, `DVR_USER`, `
 
 ## 13. Integrasi Kamera DH-P5AE-PV (Siren/Speaker)
 
-> Ditambahkan: 31 Mei 2026
+> Ditambahkan: 31 Mei 2026  
+> Diperbarui: 31 Mei 2026 — Konfigurasi siren via frontend, per-zona alarm settings
 
 ### 13.1 Kapabilitas Kamera
 
@@ -1358,13 +1362,14 @@ curl --digest -u user:pass \
 
 ### 13.3 Integrasi di Dashboard
 
-**Alur otomatis:**
+**Alur otomatis (per-zona):**
 ```
-Analyzer detect person (mode=away)
+Analyzer detect person
   → POST /api/analyzer-event
-    → Backend _trigger_alarm()
-      → HTTP CGI ke kamera DH-P5AE-PV
-        → Speaker kamera bunyi siren
+    → Backend _check_zone_alarm() evaluasi per-zona settings
+      → Jika mode=away + trigger_on_away=true → _trigger_alarm() → Siren bunyi
+      → Jika mode=home + trigger_on_home=true → _trigger_alarm() → Siren bunyi
+      → Jika mode=home + chime_on_home=true → Log chime (notifikasi ringan)
 ```
 
 **Alur manual (API):**
@@ -1373,10 +1378,15 @@ Analyzer detect person (mode=away)
 |---|---|---|---|
 | POST | `/api/siren` | `{"channel": 1}` | Trigger siren |
 | POST | `/api/siren/stop` | `{"channel": 1}` | Stop siren |
+| GET | `/api/siren-config` | — | Baca konfigurasi siren |
+| POST | `/api/siren-config` | `{"host","user","pass","enabled"}` | Simpan konfigurasi siren |
 
 ### 13.4 Konfigurasi
 
-Environment variables di `docker-compose.yml` (service `backend`):
+Konfigurasi siren bisa dilakukan melalui **2 cara**:
+
+1. **Frontend UI** (direkomendasikan): Buka ⚙ Konfigurasi → 🔔 Siren / Speaker
+2. **Environment variables** di `docker-compose.yml` (sebagai default/fallback)
 
 | Variable | Default | Keterangan |
 |---|---|---|
@@ -1384,6 +1394,83 @@ Environment variables di `docker-compose.yml` (service `backend`):
 | `SIREN_CAMERA_USER` | fallback DVR_USER | Username kamera |
 | `SIREN_CAMERA_PASS` | fallback DVR_PASS | Password kamera |
 | `SIREN_ENABLED` | `true` | Enable/disable siren trigger |
+
+> **Catatan:** Nilai dari UI (disimpan di SQLite) akan override environment variables.
+
+### 13.5 Pengaturan Alarm Per-Zona
+
+Setiap zona perimeter bisa dikonfigurasi alarm secara individu via UI:
+
+| Pengaturan | Default | Keterangan |
+|---|---|---|
+| `trigger_on_away` | `true` | Alarm bunyi saat mode Away + intrusi |
+| `trigger_on_home` | `false` | Alarm bunyi saat mode Home + intrusi |
+| `chime_on_home` | `true` | Chime ringan saat Home (bukan alarm penuh) |
+| `sound_file` | `alarm` | File suara yang dimainkan |
+
+**Use case chime:** Deteksi orang masuk meskipun ada penghuni di rumah, bunyi chime sebagai notifikasi (bukan alarm).
+
+### 13.6 Upload File Suara Custom
+
+Backend mendukung upload file suara custom (.mp3, .wav, .ogg) ke `/data/sounds/`:
+
+| Method | Path | Keterangan |
+|---|---|---|
+| GET | `/api/sounds` | Daftar file suara (built-in + custom) |
+| POST | `/api/sounds` | Upload file suara (multipart form) |
+| DELETE | `/api/sounds/:filename` | Hapus file suara custom |
+
+---
+
+## 13b. Performance Monitoring
+
+> Ditambahkan: 31 Mei 2026
+
+Dashboard menampilkan widget monitoring performa ringan di sidebar halaman utama.
+
+### Metrik yang Ditampilkan
+
+**Server (backend container):**
+- CPU usage (%)
+- RAM usage (% + total)
+- Disk usage (% volume /data)
+- Uptime
+
+**NVR (via Dahua CGI API):**
+- CPU usage (%) — via `magicBox.cgi?action=getCPUUsage`
+- RAM usage — via `magicBox.cgi?action=getMemoryInfo`
+
+### API
+
+| Method | Path | Keterangan |
+|---|---|---|
+| GET | `/api/performance` | Metrik performa server + NVR |
+
+Response:
+```json
+{
+  "server": {
+    "cpu_percent": 12.3,
+    "mem_total": 8589934592,
+    "mem_used": 2147483648,
+    "mem_percent": 25.0,
+    "disk_total": 107374182400,
+    "disk_used": 21474836480,
+    "disk_percent": 20.0,
+    "uptime_seconds": 86400
+  },
+  "nvr": {
+    "reachable": true,
+    "cpu_percent": 45.2,
+    "mem_total": 536870912,
+    "mem_used": 268435456
+  }
+}
+```
+
+### Frontend Widget
+
+Widget `PerformanceMonitor` ditampilkan di sidebar Dashboard, auto-refresh setiap 15 detik. Menampilkan mini bar chart untuk CPU, RAM, dan Disk.
 
 ---
 

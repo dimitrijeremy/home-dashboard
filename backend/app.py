@@ -1086,11 +1086,21 @@ def _get_current_mode(db):
     return row['value'] if row else 'home'
 
 
+def _get_siren_config():
+    """Get current siren configuration from DB with env fallback."""
+    host = _db_setting('siren_host', SIREN_CAMERA_HOST)
+    user = _db_setting('siren_user', SIREN_CAMERA_USER) or DVR_USER
+    passwd = _db_setting('siren_pass', SIREN_CAMERA_PASS) or DVR_PASS
+    enabled = _db_setting('siren_enabled', 'true' if SIREN_ENABLED else 'false') == 'true'
+    return host, user, passwd, enabled
+
+
 def _trigger_siren(channel: int = 1):
     """Trigger siren/speaker on camera (DH-P5AE-PV or similar Dahua with built-in speaker).
     Uses coaxialControl CGI for alarm output and audioOutput for tone playback.
     """
-    if not SIREN_CAMERA_HOST or not SIREN_ENABLED:
+    host, user, passwd, enabled = _get_siren_config()
+    if not host or not enabled:
         print("[SIREN] Skipped — SIREN_CAMERA_HOST not configured or disabled", flush=True)
         return False
 
@@ -1104,8 +1114,8 @@ def _trigger_siren(channel: int = 1):
     for path in endpoints:
         try:
             resp = requests.get(
-                f"http://{SIREN_CAMERA_HOST}{path}",
-                auth=HTTPDigestAuth(SIREN_CAMERA_USER, SIREN_CAMERA_PASS),
+                f"http://{host}{path}",
+                auth=HTTPDigestAuth(user, passwd),
                 timeout=5,
             )
             if resp.status_code == 200:
@@ -1120,12 +1130,13 @@ def _trigger_siren(channel: int = 1):
 
 def _stop_siren(channel: int = 1):
     """Stop siren/speaker on camera."""
-    if not SIREN_CAMERA_HOST:
+    host, user, passwd, enabled = _get_siren_config()
+    if not host:
         return False
     try:
         resp = requests.get(
-            f"http://{SIREN_CAMERA_HOST}/cgi-bin/alarm.cgi?action=stop&channel={channel}",
-            auth=HTTPDigestAuth(SIREN_CAMERA_USER, SIREN_CAMERA_PASS),
+            f"http://{host}/cgi-bin/alarm.cgi?action=stop&channel={channel}",
+            auth=HTTPDigestAuth(user, passwd),
             timeout=5,
         )
         return resp.status_code == 200
@@ -1185,7 +1196,7 @@ def _nvr_guard_get() -> dict:
 
 
 def _trigger_alarm(event_body):
-    """Called when mode=away and a human detection event arrives.
+    """Called when alarm condition is met.
     Triggers siren on camera speaker + logs alarm.
     """
     print(
@@ -1197,6 +1208,54 @@ def _trigger_alarm(event_body):
     )
     # Trigger camera siren in background thread to not block request
     threading.Thread(target=_trigger_siren, daemon=True).start()
+
+
+def _check_zone_alarm(event_body, current_mode, db):
+    """Check per-zone alarm settings to determine if alarm or chime should trigger.
+    Returns: 'alarm', 'chime', or None
+    """
+    zone_name = event_body.get('zone_name')
+    if not zone_name:
+        # Fallback to global logic
+        event_type = event_body.get('event_type', 'Unknown')
+        if current_mode == 'away' and event_type in ALARM_EVENT_TYPES:
+            return 'alarm'
+        return None
+
+    # Find zone by name
+    row = db.execute("SELECT id FROM zones WHERE name=?", (zone_name,)).fetchone()
+    if not row:
+        # Zone not found, fallback
+        event_type = event_body.get('event_type', 'Unknown')
+        if current_mode == 'away' and event_type in ALARM_EVENT_TYPES:
+            return 'alarm'
+        return None
+
+    zone_id = row['id']
+    settings_raw = _db_setting(f'zone_{zone_id}_alarm', '')
+    if settings_raw:
+        try:
+            settings = json.loads(settings_raw)
+        except Exception:
+            settings = {}
+    else:
+        settings = {}
+
+    trigger_on_home = settings.get('trigger_on_home', False)
+    trigger_on_away = settings.get('trigger_on_away', True)
+    chime_on_home = settings.get('chime_on_home', True)
+
+    event_type = event_body.get('event_type', 'Unknown')
+    if event_type not in ALARM_EVENT_TYPES:
+        return None
+
+    if current_mode == 'away' and trigger_on_away:
+        return 'alarm'
+    if current_mode == 'home' and trigger_on_home:
+        return 'alarm'
+    if current_mode == 'home' and chime_on_home:
+        return 'chime'
+    return None
 
 
 @app.route('/api/mode', methods=['GET'])
@@ -1273,10 +1332,13 @@ def receive_analyzer_event():
     ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     db = get_db()
 
-    # Check alarm condition: mode=away + human detection event
+    # Check alarm condition using per-zone settings
     current_mode = _get_current_mode(db)
     event_type   = body.get('event_type', 'Unknown')
-    alarm        = 1 if (current_mode == 'away' and event_type in ALARM_EVENT_TYPES) else 0
+
+    # Per-zone alarm logic
+    zone_result = _check_zone_alarm(body, current_mode, db)
+    alarm = 1 if zone_result == 'alarm' else 0
 
     db.execute(
         """INSERT INTO detection_events
@@ -1296,8 +1358,11 @@ def receive_analyzer_event():
     )
     db.commit()
 
-    if alarm:
+    if zone_result == 'alarm':
         _trigger_alarm(body)
+    elif zone_result == 'chime':
+        print(f"[CHIME] Zone '{body.get('zone_name')}' triggered chime (home mode)", flush=True)
+        # Chime uses a softer trigger (same endpoint, but logged differently)
 
     # Also push into in-memory NVR event deque so NVREventLog picks it up live
     event = {
@@ -1309,6 +1374,7 @@ def receive_analyzer_event():
         'person':         body.get('person_name'),
         'channel':        body.get('channel_id', ''),
         'alarm':          bool(alarm),
+        'chime':          zone_result == 'chime',
     }
     with _nvr_lock:
         _nvr_events.appendleft(event)
@@ -1353,6 +1419,241 @@ def camera_snapshot(cam_id):
     with open(snap_path, 'rb') as f:
         data = f.read()
     return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache'}
+
+
+# ── Siren Config CRUD ─────────────────────────────────────────────────────────
+
+@app.route('/api/siren-config', methods=['GET'])
+def get_siren_config():
+    """Get siren configuration from DB settings."""
+    return jsonify({
+        'host': _db_setting('siren_host', SIREN_CAMERA_HOST),
+        'user': _db_setting('siren_user', SIREN_CAMERA_USER),
+        'pass': _db_setting('siren_pass', SIREN_CAMERA_PASS),
+        'enabled': _db_setting('siren_enabled', 'true' if SIREN_ENABLED else 'false') == 'true',
+    })
+
+
+@app.route('/api/siren-config', methods=['POST'])
+def set_siren_config():
+    """Save siren configuration to DB settings."""
+    body = request.get_json(silent=True) or {}
+    if 'host' in body:
+        _set_db_setting('siren_host', (body['host'] or '').strip())
+    if 'user' in body:
+        _set_db_setting('siren_user', (body['user'] or '').strip())
+    if 'pass' in body:
+        _set_db_setting('siren_pass', body['pass'])
+    if 'enabled' in body:
+        _set_db_setting('siren_enabled', 'true' if body['enabled'] else 'false')
+
+    # Update runtime globals
+    global SIREN_CAMERA_HOST, SIREN_CAMERA_USER, SIREN_CAMERA_PASS, SIREN_ENABLED
+    SIREN_CAMERA_HOST = _db_setting('siren_host', '')
+    SIREN_CAMERA_USER = _db_setting('siren_user', '') or DVR_USER
+    SIREN_CAMERA_PASS = _db_setting('siren_pass', '') or DVR_PASS
+    SIREN_ENABLED = _db_setting('siren_enabled', 'true') == 'true'
+
+    return jsonify({'ok': True})
+
+
+# ── Zone Alarm Settings ───────────────────────────────────────────────────────
+
+@app.route('/api/zones/<int:zone_id>/alarm-settings', methods=['GET'])
+def get_zone_alarm_settings(zone_id):
+    """Get alarm settings for a zone."""
+    db = get_db()
+    if not db.execute("SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        return jsonify({'error': 'not found'}), 404
+    settings_raw = _db_setting(f'zone_{zone_id}_alarm', '')
+    if settings_raw:
+        try:
+            return jsonify(json.loads(settings_raw))
+        except Exception:
+            pass
+    # Default settings
+    return jsonify({
+        'trigger_on_home': False,
+        'trigger_on_away': True,
+        'sound_file': 'alarm',
+        'chime_on_home': True,
+    })
+
+
+@app.route('/api/zones/<int:zone_id>/alarm-settings', methods=['POST'])
+def set_zone_alarm_settings(zone_id):
+    """Set alarm settings for a zone."""
+    db = get_db()
+    if not db.execute("SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        return jsonify({'error': 'not found'}), 404
+    body = request.get_json(silent=True) or {}
+    settings = {
+        'trigger_on_home': bool(body.get('trigger_on_home', False)),
+        'trigger_on_away': bool(body.get('trigger_on_away', True)),
+        'sound_file': (body.get('sound_file') or 'alarm').strip(),
+        'chime_on_home': bool(body.get('chime_on_home', True)),
+    }
+    _set_db_setting(f'zone_{zone_id}_alarm', json.dumps(settings))
+    return jsonify(settings)
+
+
+# ── Sound Files Management ────────────────────────────────────────────────────
+
+SOUND_DIR = os.getenv("SOUND_DIR", "/data/sounds")
+
+
+@app.route('/api/sounds', methods=['GET'])
+def list_sounds():
+    """List available sound files."""
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    files = []
+    for fname in sorted(os.listdir(SOUND_DIR)):
+        if fname.lower().endswith(('.mp3', '.wav', '.ogg')):
+            files.append({'name': os.path.splitext(fname)[0], 'filename': fname})
+    # Always include built-in options
+    builtins = [
+        {'name': 'alarm', 'filename': '__builtin_alarm', 'builtin': True},
+        {'name': 'chime', 'filename': '__builtin_chime', 'builtin': True},
+    ]
+    return jsonify(builtins + files)
+
+
+@app.route('/api/sounds', methods=['POST'])
+def upload_sound():
+    """Upload a custom sound file."""
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({'error': 'Empty filename'}), 400
+    # Sanitize filename
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', f.filename)
+    if not safe_name.lower().endswith(('.mp3', '.wav', '.ogg')):
+        return jsonify({'error': 'Only .mp3, .wav, .ogg files allowed'}), 400
+    filepath = os.path.join(SOUND_DIR, safe_name)
+    f.save(filepath)
+    return jsonify({'ok': True, 'name': os.path.splitext(safe_name)[0], 'filename': safe_name}), 201
+
+
+@app.route('/api/sounds/<filename>', methods=['DELETE'])
+def delete_sound(filename):
+    """Delete a custom sound file."""
+    if filename.startswith('__builtin'):
+        return jsonify({'error': 'Cannot delete built-in sounds'}), 400
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', filename)
+    filepath = os.path.join(SOUND_DIR, safe_name)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    return '', 204
+
+
+# ── Performance Monitoring ────────────────────────────────────────────────────
+
+@app.route('/api/performance', methods=['GET'])
+def get_performance():
+    """Get server and NVR performance metrics."""
+    import platform
+
+    # Server metrics
+    server_metrics = {
+        'hostname': platform.node(),
+        'platform': platform.system(),
+    }
+
+    # CPU usage (simple /proc/stat parse or fallback)
+    try:
+        with open('/proc/stat', 'r') as f:
+            line = f.readline()
+        parts = line.split()
+        idle = int(parts[4])
+        total = sum(int(p) for p in parts[1:])
+        # Store for delta calculation
+        if not hasattr(get_performance, '_prev_cpu'):
+            get_performance._prev_cpu = (idle, total)
+            cpu_percent = 0.0
+        else:
+            prev_idle, prev_total = get_performance._prev_cpu
+            d_idle = idle - prev_idle
+            d_total = total - prev_total
+            cpu_percent = round((1.0 - d_idle / max(d_total, 1)) * 100, 1)
+            get_performance._prev_cpu = (idle, total)
+        server_metrics['cpu_percent'] = cpu_percent
+    except Exception:
+        server_metrics['cpu_percent'] = None
+
+    # Memory usage
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            mem = {}
+            for line in f:
+                parts = line.split()
+                if parts[0].rstrip(':') in ('MemTotal', 'MemAvailable', 'MemFree'):
+                    mem[parts[0].rstrip(':')] = int(parts[1]) * 1024  # kB to bytes
+        total_mem = mem.get('MemTotal', 0)
+        avail_mem = mem.get('MemAvailable', mem.get('MemFree', 0))
+        used_mem = total_mem - avail_mem
+        server_metrics['mem_total'] = total_mem
+        server_metrics['mem_used'] = used_mem
+        server_metrics['mem_percent'] = round(used_mem / max(total_mem, 1) * 100, 1)
+    except Exception:
+        server_metrics['mem_total'] = None
+        server_metrics['mem_used'] = None
+        server_metrics['mem_percent'] = None
+
+    # Disk usage (data volume)
+    try:
+        st = os.statvfs('/data')
+        total_disk = st.f_blocks * st.f_frsize
+        free_disk = st.f_bavail * st.f_frsize
+        used_disk = total_disk - free_disk
+        server_metrics['disk_total'] = total_disk
+        server_metrics['disk_used'] = used_disk
+        server_metrics['disk_percent'] = round(used_disk / max(total_disk, 1) * 100, 1)
+    except Exception:
+        server_metrics['disk_total'] = None
+        server_metrics['disk_used'] = None
+        server_metrics['disk_percent'] = None
+
+    # Uptime
+    try:
+        with open('/proc/uptime', 'r') as f:
+            uptime_secs = float(f.read().split()[0])
+        server_metrics['uptime_seconds'] = int(uptime_secs)
+    except Exception:
+        server_metrics['uptime_seconds'] = None
+
+    # NVR metrics (from NVR API)
+    nvr_metrics = {'reachable': False}
+    try:
+        user, passwd = _get_nvr_event_creds()
+        resp = requests.get(
+            f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/magicBox.cgi?action=getMemoryInfo",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            nvr_metrics['reachable'] = True
+            kv = _parse_dahua_kv_text(resp.text)
+            nvr_metrics['mem_total'] = int(kv.get('status.Total', 0))
+            nvr_metrics['mem_used'] = int(kv.get('status.Used', 0))
+
+        # CPU
+        resp2 = requests.get(
+            f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/magicBox.cgi?action=getCPUUsage",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=5,
+        )
+        if resp2.status_code == 200:
+            kv2 = _parse_dahua_kv_text(resp2.text)
+            nvr_metrics['cpu_percent'] = float(kv2.get('status.CPUUsage', kv2.get('usage', 0)))
+    except Exception as e:
+        nvr_metrics['error'] = str(e)
+
+    return jsonify({
+        'server': server_metrics,
+        'nvr': nvr_metrics,
+    })
 
 
 _nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")

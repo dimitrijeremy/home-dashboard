@@ -1,6 +1,6 @@
 # home-dashboard
 
-Dashboard rumah dengan CCTV live, kontrol smart home, cuaca, NVR event stream, dan AI deteksi perimeter (YOLOv8 + face recognition).
+Dashboard rumah dengan CCTV live, kontrol smart home, cuaca, NVR event stream, AI deteksi perimeter (YOLOv8 + face recognition), integrasi siren/speaker, dan monitoring performa server/NVR.
 
 ---
 
@@ -27,8 +27,8 @@ Dahua NVR (RTSPS :554)
 | Nama | Cara jalankan | Port | Keterangan |
 |------|--------------|------|------------|
 | **mtx / mediamtx** | Docker Compose | RTSP `8554`, HLS `8888` | Otomatis start saat `docker compose up -d`. `runOnInit` memanggil `mtx/start_stream.sh` untuk ch1–ch4 tanpa perlu menjalankan script manual. |
-| **backend** | Docker Compose | `5001` | Flask API: kamera, zona, wajah, event NVR, event deteksi AI. Data disimpan di volume `camera_data`. |
-| **frontend** | Docker Compose | `5173` lokal, `8088` server | Dashboard utama + halaman konfigurasi AI. |
+| **backend** | Docker Compose | `5001` | Flask API: kamera, zona, wajah, event NVR, event deteksi AI, siren, monitoring performa. Data disimpan di volume `camera_data`. |
+| **frontend** | Docker Compose | `5173` lokal, `8088` server | Dashboard utama + halaman konfigurasi AI + monitoring performa. |
 | **analyzer** | Docker Compose (profile `ai`) | — | YOLOv8n + InsightFace. Baca RTSP dari mediamtx, kirim event ke backend. **Opsional.** |
 
 ---
@@ -70,6 +70,8 @@ Setelah analyzer jalan, buka halaman **⚙ Konfigurasi** di dashboard untuk:
 - Menggambar zona perimeter per kamera
 - Mendaftarkan wajah penghuni
 - Melihat riwayat event deteksi
+- Mengatur siren/speaker kamera
+- Mengatur alarm/chime per zona
 
 ### 3. Update Service dengan Docker Compose
 
@@ -102,12 +104,17 @@ docker compose restart mtx
 | `DB_PATH` | `/data/cameras.db` | Path SQLite database (di dalam volume) |
 | `FACE_PHOTO_DIR` | `/data/face_photos` | Direktori foto wajah terdaftar |
 | `SNAPSHOT_DIR` | `/data/snapshots` | Direktori snapshot kamera dari analyzer |
+| `SOUND_DIR` | `/data/sounds` | Direktori file suara custom untuk alarm/chime |
 | `DVR_HOST` | `10.10.30.2` | IP Dahua NVR |
 | `DVR_HTTP_PORT` | `80` | Port HTTP NVR |
 | `DVR_USER` | `dashboard` | User untuk RTSP (dibaca stream) |
 | `DVR_PASS` | `d4$$hb0ard-dlt` | Password DVR_USER (di compose gunakan `$$` untuk karakter `$`) |
 | `DVR_EVENT_USER` | _(sama dengan DVR_USER)_ | User untuk NVR event stream. Butuh hak **Remote Alarm/Event**. Kosongkan untuk fallback ke DVR_USER. |
 | `DVR_EVENT_PASS` | _(sama dengan DVR_PASS)_ | Password DVR_EVENT_USER |
+| `SIREN_CAMERA_HOST` | _(kosong)_ | IP kamera dengan speaker. Bisa diset via UI. |
+| `SIREN_CAMERA_USER` | _(fallback DVR_USER)_ | Username untuk kamera siren. Bisa diset via UI. |
+| `SIREN_CAMERA_PASS` | _(fallback DVR_PASS)_ | Password untuk kamera siren. Bisa diset via UI. |
+| `SIREN_ENABLED` | `true` | Aktifkan/nonaktifkan siren global. Bisa diset via UI. |
 
 ### Analyzer (`docker-compose.yml` → service `analyzer`)
 
@@ -120,6 +127,46 @@ docker compose restart mtx
 | `FACE_THRESH` | `0.40` | Threshold similarity untuk pengenalan wajah (0–1) |
 | `ZONE_CONF` | `0.40` | Confidence minimum YOLO untuk deteksi orang |
 | `COOLDOWN_SECS` | `20` | Jeda minimum antar event per orang per zona (detik) |
+
+---
+
+## Fitur Utama
+
+### Integrasi Siren / Speaker
+
+Dashboard mendukung integrasi dengan kamera Dahua yang memiliki built-in speaker (seperti DH-P5AE-PV). Konfigurasi siren bisa dilakukan sepenuhnya dari frontend:
+
+1. Buka **⚙ Konfigurasi → 🔔 Siren / Speaker**
+2. Masukkan IP kamera siren, username, dan password
+3. Aktifkan/nonaktifkan siren sesuai kebutuhan
+
+Siren otomatis berbunyi saat alarm trigger berdasarkan pengaturan per-zona.
+
+### Pengaturan Alarm Per-Zona
+
+Setiap zona perimeter bisa dikonfigurasi secara individu:
+
+- **Trigger alarm saat Away** — alarm berbunyi (siren) saat ada intrusi dan mode = pergi
+- **Trigger alarm saat Home** — alarm berbunyi meski ada penghuni di rumah
+- **Chime saat Home** — bunyi notifikasi ringan (bukan alarm) saat ada orang masuk zona di mode Home
+
+Ini memungkinkan deteksi intrusi bahkan saat ada orang di rumah, dengan chime sebagai notifikasi.
+
+#### Upload File Suara Custom
+
+Pada halaman pengaturan alarm zona, Anda bisa:
+- Memilih suara built-in (alarm / chime)
+- Upload file suara custom (.mp3, .wav, .ogg)
+- Menghapus file suara custom yang tidak dibutuhkan
+
+### Performance Monitoring
+
+Dashboard menampilkan widget monitoring performa ringan di sidebar:
+
+- **Server**: CPU %, RAM %, Disk %, dan uptime
+- **NVR**: CPU % dan RAM (jika NVR mendukung API `magicBox`)
+
+Data di-refresh otomatis setiap 15 detik.
 
 ---
 
@@ -152,19 +199,19 @@ home-dashboard/
 ├── start_custom_stream.sh       # Legacy host script
 │
 ├── backend/
-│   ├── app.py            # Flask API: kamera, NVR events, zona, wajah, AI events
+│   ├── app.py            # Flask API: kamera, NVR events, zona, wajah, AI events, siren, performa
 │   ├── requirements.txt
 │   └── Dockerfile
 │
 ├── frontend/
 │   ├── src/
 │   │   ├── pages/
-│   │   │   ├── Dashboard.jsx    # Halaman utama: CCTV grid, cuaca, smart home
-│   │   │   └── ConfigPage.jsx   # Halaman konfigurasi AI (zona, wajah, riwayat)
+│   │   │   ├── Dashboard.jsx    # Halaman utama: CCTV grid, cuaca, smart home, monitoring
+│   │   │   └── ConfigPage.jsx   # Halaman konfigurasi AI (zona, wajah, riwayat, siren, NVR)
 │   │   ├── features/
 │   │   │   ├── cctv/            # CCTVPlayer, AddChannelModal
-│   │   │   ├── detection/       # ZoneEditor, FaceManager, EventHistory
-│   │   │   ├── smarthome/       # SmartControls, NVREventLog
+│   │   │   ├── detection/       # ZoneEditor, ZoneAlarmSettings, FaceManager, EventHistory
+│   │   │   ├── smarthome/       # SmartControls, NVREventLog, SirenConfig, PerformanceMonitor
 │   │   │   └── weather/         # WeatherWidget
 │   │   └── services/api.js      # Semua fungsi fetch ke backend
 │   └── Dockerfile
@@ -192,8 +239,13 @@ home-dashboard/
 | GET/POST | `/api/nvr-guard` | NVR arm/disarm status |
 | POST | `/api/siren` | Trigger siren kamera (DH-P5AE-PV) |
 | POST | `/api/siren/stop` | Stop siren kamera |
+| GET/POST | `/api/siren-config` | Konfigurasi siren (IP, credential, enabled) |
 | GET/POST | `/api/zones` | Zona perimeter |
 | DELETE/PATCH | `/api/zones/:id` | Edit/hapus zona |
+| GET/POST | `/api/zones/:id/alarm-settings` | Pengaturan alarm per zona (trigger mode, sound) |
+| GET | `/api/sounds` | Daftar file suara (built-in + custom) |
+| POST | `/api/sounds` | Upload file suara custom |
+| DELETE | `/api/sounds/:filename` | Hapus file suara custom |
 | GET/POST | `/api/faces` | Wajah terdaftar |
 | DELETE | `/api/faces/:id` | Hapus wajah |
 | GET | `/api/faces/:id/photo` | Foto wajah |
@@ -201,6 +253,9 @@ home-dashboard/
 | POST | `/api/analyzer-event` | Intake event dari analyzer (internal) |
 | GET | `/api/detection-events` | Riwayat event AI (zona/wajah) |
 | DELETE | `/api/detection-events` | Hapus semua riwayat |
+| GET | `/api/performance` | Metrik performa server + NVR |
+| GET/POST | `/api/nvr-config` | Kredensial NVR (stream + event) |
+| GET | `/api/nvr-info` | Info perangkat NVR |
 
 ---
 
@@ -231,6 +286,16 @@ curl -s http://localhost:5173/ch1/video1_stream.m3u8 -o /dev/null -w "%{http_cod
 **NVR Event Log "Terputus"**
 - Pastikan `DVR_EVENT_USER` punya hak Remote Alarm di NVR
 - Cek log: `docker compose logs backend | grep NVR`
+
+**Siren tidak berbunyi**
+- Pastikan IP kamera siren sudah dikonfigurasi di ⚙ Konfigurasi → 🔔 Siren / Speaker
+- Cek konektivitas: `curl -v http://<IP_KAMERA>/cgi-bin/magicBox.cgi?action=getDeviceType`
+- Cek log: `docker compose logs backend | grep SIREN`
+
+**Performance monitoring menunjukkan "Tidak terhubung" untuk NVR**
+- Pastikan NVR reachable dari container backend
+- Cek credential NVR di ⚙ Konfigurasi → 📡 Kredensial NVR
+- NVR harus support endpoint `magicBox.cgi` (Dahua firmware)
 
 **Analyzer tidak jalan**
 ```bash

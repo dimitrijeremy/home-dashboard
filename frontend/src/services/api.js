@@ -233,3 +233,71 @@ export async function stopSiren(channel = 1) {
   if (!res.ok) throw new Error('Failed to stop siren')
   return res.json()
 }
+
+// ── Siren Config ──────────────────────────────────────────────────────────────
+
+export async function fetchSirenConfig() {
+  const res = await fetch(url('/api/siren-config'))
+  if (!res.ok) throw new Error('Failed to fetch siren config')
+  return res.json()
+}
+
+export async function postSirenConfig(data) {
+  const res = await fetch(url('/api/siren-config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error('Failed to save siren config')
+  return res.json()
+}
+
+// ── Zone Alarm Settings ───────────────────────────────────────────────────────
+
+export async function fetchZoneAlarmSettings(zoneId) {
+  const res = await fetch(url(`/api/zones/${zoneId}/alarm-settings`))
+  if (!res.ok) throw new Error('Failed to fetch zone alarm settings')
+  return res.json()
+}
+
+export async function postZoneAlarmSettings(zoneId, data) {
+  const res = await fetch(url(`/api/zones/${zoneId}/alarm-settings`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error('Failed to save zone alarm settings')
+  return res.json()
+}
+
+// ── Sound Files ───────────────────────────────────────────────────────────────
+
+export async function fetchSounds() {
+  const res = await fetch(url('/api/sounds'))
+  if (!res.ok) throw new Error('Failed to fetch sounds')
+  return res.json()
+}
+
+export async function uploadSound(file) {
+  const fd = new FormData()
+  fd.append('file', file)
+  const res = await fetch(url('/api/sounds'), { method: 'POST', body: fd })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to upload sound')
+  }
+  return res.json()
+}
+
+export async function deleteSound(filename) {
+  const res = await fetch(url(`/api/sounds/${encodeURIComponent(filename)}`), { method: 'DELETE' })
+  if (!res.ok && res.status !== 204) throw new Error('Failed to delete sound')
+}
+
+// ── Performance Monitoring ────────────────────────────────────────────────────
+
+export async function fetchPerformance() {
+  const res = await fetch(url('/api/performance'))
+  if (!res.ok) throw new Error('Failed to fetch performance')
+  return res.json()
+}
