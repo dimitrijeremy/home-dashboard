@@ -5,13 +5,15 @@ import ZoneAlarmSettings from '../features/detection/ZoneAlarmSettings'
 import FaceManager from '../features/detection/FaceManager'
 import EventHistory from '../features/detection/EventHistory'
 import SirenConfig from '../features/smarthome/SirenConfig'
+import DoorLockConfig from '../features/smarthome/DoorLockConfig'
 
 const TABS = [
-  { id: 'zones',   label: '📐 Zona Perimeter' },
-  { id: 'faces',   label: '👤 Wajah Dikenal' },
-  { id: 'history', label: '📋 Riwayat Deteksi' },
-  { id: 'siren',   label: '🔔 Siren / Speaker' },
-  { id: 'nvr',     label: '📡 Kredensial NVR' },
+  { id: 'zones',    label: '📐 Zona Perimeter' },
+  { id: 'faces',    label: '👤 Wajah Dikenal' },
+  { id: 'history',  label: '📋 Riwayat Deteksi' },
+  { id: 'siren',    label: '🔔 Siren / Speaker' },
+  { id: 'doorlock', label: '🚪 Door Lock' },
+  { id: 'nvr',      label: '📡 Kredensial NVR' },
 ]
 
 export default function ConfigPage({ onBack }) {
@@ -174,6 +176,16 @@ export default function ConfigPage({ onBack }) {
               Siren akan berbunyi otomatis saat alarm trigger berdasarkan pengaturan zona.
             </div>
             <SirenConfig />
+          </div>
+        )}
+
+        {tab === 'doorlock' && (
+          <div className="config-section">
+            <div className="config-section-intro">
+              Konfigurasi smart door lock Paloma DLP6202 via Tuya Cloud.
+              Hubungkan akun Tuya IoT Platform untuk mengontrol kunci pintu, melihat kamera, dan intercom.
+            </div>
+            <DoorLockConfig />
           </div>
         )}
 

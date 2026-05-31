@@ -48,6 +48,11 @@ services:
       - SIREN_CAMERA_USER=
       - SIREN_CAMERA_PASS=
       - SIREN_ENABLED=true
+      # Smart Door Lock (Paloma DLP6202 via Tuya Cloud)
+      - TUYA_ACCESS_ID=
+      - TUYA_ACCESS_SECRET=
+      - TUYA_DEVICE_ID=
+      - TUYA_REGION=us
     volumes:
       - camera_data:/data
     networks:

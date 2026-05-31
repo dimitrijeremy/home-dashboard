@@ -1667,10 +1667,220 @@ def get_performance():
     })
 
 
+# ── Smart Door Lock (Paloma DLP6202 via Tuya) ─────────────────────────────────
+
+from doorlock import doorlock as _doorlock_instance
+
+# Door lock config keys in settings table
+_DOORLOCK_KEYS = ('doorlock_access_id', 'doorlock_access_secret',
+                  'doorlock_device_id', 'doorlock_region', 'doorlock_uid')
+
+
+def _get_doorlock_config():
+    """Read doorlock configuration from DB."""
+    return {
+        'access_id': _db_setting('doorlock_access_id', ''),
+        'access_secret': _db_setting('doorlock_access_secret', ''),
+        'device_id': _db_setting('doorlock_device_id', ''),
+        'region': _db_setting('doorlock_region', 'us'),
+        'uid': _db_setting('doorlock_uid', ''),
+    }
+
+
+def _init_doorlock():
+    """Try to initialize doorlock connection from saved config."""
+    cfg = _get_doorlock_config()
+    if cfg.get('access_id') and cfg.get('access_secret') and cfg.get('device_id'):
+        try:
+            _doorlock_instance.configure(cfg)
+        except Exception as e:
+            print(f"[DOORLOCK] Init failed: {e}", flush=True)
+
+
+@app.route('/api/doorlock/config', methods=['GET'])
+def get_doorlock_config():
+    """Get doorlock configuration (secrets masked)."""
+    cfg = _get_doorlock_config()
+    return jsonify({
+        'access_id': cfg['access_id'],
+        'access_secret': '••••' + cfg['access_secret'][-4:] if len(cfg['access_secret']) > 4 else '',
+        'device_id': cfg['device_id'],
+        'region': cfg['region'],
+        'uid': cfg['uid'],
+        'connected': _doorlock_instance.connected,
+        'error': _doorlock_instance.last_error,
+    })
+
+
+@app.route('/api/doorlock/config', methods=['POST'])
+def set_doorlock_config():
+    """Save doorlock configuration and attempt connection."""
+    body = request.get_json(silent=True) or {}
+
+    if 'access_id' in body:
+        _set_db_setting('doorlock_access_id', (body['access_id'] or '').strip())
+    if 'access_secret' in body:
+        val = (body['access_secret'] or '').strip()
+        # Don't overwrite with masked value
+        if val and not val.startswith('••••'):
+            _set_db_setting('doorlock_access_secret', val)
+    if 'device_id' in body:
+        _set_db_setting('doorlock_device_id', (body['device_id'] or '').strip())
+    if 'region' in body:
+        _set_db_setting('doorlock_region', (body['region'] or 'us').strip().lower())
+    if 'uid' in body:
+        _set_db_setting('doorlock_uid', (body['uid'] or '').strip())
+
+    # Reconnect with new config
+    cfg = _get_doorlock_config()
+    ok = _doorlock_instance.configure(cfg)
+
+    return jsonify({
+        'ok': ok,
+        'connected': _doorlock_instance.connected,
+        'error': _doorlock_instance.last_error,
+    })
+
+
+@app.route('/api/doorlock/status', methods=['GET'])
+def get_doorlock_status():
+    """Get current door lock status (battery, lock state, etc.)."""
+    if not _doorlock_instance.connected:
+        return jsonify({
+            'ok': False,
+            'connected': False,
+            'error': _doorlock_instance.last_error or 'Not connected',
+        })
+
+    try:
+        status = _doorlock_instance.get_device_status()
+        return jsonify({'ok': True, 'connected': True, 'status': status})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/unlock', methods=['POST'])
+def doorlock_unlock():
+    """Send remote unlock command to door lock."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.unlock()
+        return jsonify({'ok': True, 'message': 'Unlock command sent'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/lock', methods=['POST'])
+def doorlock_lock():
+    """Send remote lock command to door lock."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.lock()
+        return jsonify({'ok': True, 'message': 'Lock command sent'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/camera/stream', methods=['POST'])
+def doorlock_camera_stream():
+    """Allocate a temporary camera stream URL."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        stream_info = _doorlock_instance.get_camera_stream()
+        return jsonify({'ok': True, 'stream': stream_info})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/camera/stop', methods=['POST'])
+def doorlock_camera_stop():
+    """Stop/deallocate camera stream."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.stop_camera_stream()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/talk/start', methods=['POST'])
+def doorlock_talk_start():
+    """Start two-way audio (speak & listen) session."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        session = _doorlock_instance.start_talk()
+        return jsonify({'ok': True, 'session': session})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/talk/stop', methods=['POST'])
+def doorlock_talk_stop():
+    """Stop two-way audio session."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        _doorlock_instance.stop_talk()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/doorlock/alerts', methods=['GET'])
+def doorlock_alerts():
+    """Get door lock alerts/events."""
+    if not _doorlock_instance.connected:
+        # Return local events even if not connected
+        return jsonify({
+            'ok': True,
+            'connected': False,
+            'alerts': _doorlock_instance.get_local_events(),
+        })
+
+    try:
+        limit = int(request.args.get('limit', 20))
+        alerts = _doorlock_instance.get_alerts(limit=limit)
+        return jsonify({'ok': True, 'connected': True, 'alerts': alerts})
+    except Exception as e:
+        return jsonify({
+            'ok': True,
+            'connected': True,
+            'alerts': _doorlock_instance.get_local_events(),
+            'error': str(e)[:200],
+        })
+
+
+@app.route('/api/doorlock/info', methods=['GET'])
+def doorlock_info():
+    """Get door lock device information."""
+    if not _doorlock_instance.connected:
+        return jsonify({'ok': False, 'error': 'Not connected'}), 503
+
+    try:
+        info = _doorlock_instance.get_device_info()
+        return jsonify({'ok': True, 'info': info})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 _nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")
 _nvr_thread.start()
 
 init_db()
+
+# Initialize doorlock after DB is ready
+_init_doorlock()
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))

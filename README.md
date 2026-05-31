@@ -115,6 +115,10 @@ docker compose restart mtx
 | `SIREN_CAMERA_USER` | _(fallback DVR_USER)_ | Username untuk kamera siren. Bisa diset via UI. |
 | `SIREN_CAMERA_PASS` | _(fallback DVR_PASS)_ | Password untuk kamera siren. Bisa diset via UI. |
 | `SIREN_ENABLED` | `true` | Aktifkan/nonaktifkan siren global. Bisa diset via UI. |
+| `TUYA_ACCESS_ID` | _(kosong)_ | Tuya Cloud Access ID. Bisa diset via UI. |
+| `TUYA_ACCESS_SECRET` | _(kosong)_ | Tuya Cloud Access Secret. Bisa diset via UI. |
+| `TUYA_DEVICE_ID` | _(kosong)_ | Device ID door lock di Tuya Cloud. Bisa diset via UI. |
+| `TUYA_REGION` | `us` | Region Tuya Cloud (us/eu/cn/in). Bisa diset via UI. |
 
 ### Analyzer (`docker-compose.yml` → service `analyzer`)
 
@@ -168,6 +172,61 @@ Dashboard menampilkan widget monitoring performa ringan di sidebar:
 
 Data di-refresh otomatis setiap 15 detik.
 
+### Smart Door Lock (Paloma DLP6202)
+
+Dashboard mendukung integrasi dengan smart door lock **Paloma DLP6202** melalui **Tuya Cloud API**. Fitur yang tersedia:
+
+- **Remote Unlock/Lock** — buka/kunci pintu dari dashboard
+- **Live Camera** — lihat kamera pintu real-time (stream HLS dari Tuya Cloud)
+- **Two-Way Audio (Intercom)** — bicara dan dengar pengunjung di pintu
+- **Alert Stream** — riwayat event: doorbell, unlock, alarm, battery low
+- **Device Status** — level baterai, status kunci, dll.
+
+#### Cara Konfigurasi
+
+1. Buka **⚙ Konfigurasi → 🚪 Door Lock**
+2. Masukkan kredensial Tuya Cloud:
+   - **Access ID** & **Access Secret** — dari [Tuya IoT Platform](https://iot.tuya.com)
+   - **Device ID** — ID perangkat door lock di Tuya Cloud
+   - **Region** — pilih sesuai data center (US/EU/CN/IN)
+3. Klik **Simpan & Hubungkan**
+
+#### Cara Mendapatkan Kredensial Tuya
+
+1. Daftar di [iot.tuya.com](https://iot.tuya.com)
+2. Buat **Cloud Project** → pilih region yang sesuai
+3. Link akun **Smart Life / Tuya Smart** Anda ke project
+4. Catat **Access ID**, **Access Secret**, dan **Device ID**
+5. Aktifkan API permissions: **IoT Core**, **Smart Lock**, **IR Control**, **IPC**
+
+#### Arsitektur Integrasi
+
+```
+Paloma DLP6202 (WiFi)
+    │
+    └── Tuya Cloud API (openapi.tuyaXX.com)
+            │
+        Backend container (Flask)
+        ├── /api/doorlock/config     — konfigurasi koneksi
+        ├── /api/doorlock/status     — status perangkat
+        ├── /api/doorlock/unlock     — buka pintu
+        ├── /api/doorlock/lock       — kunci pintu
+        ├── /api/doorlock/camera/*   — stream kamera
+        ├── /api/doorlock/talk/*     — intercom (speak/listen)
+        └── /api/doorlock/alerts     — riwayat event
+            │
+        Frontend Dashboard
+        ├── Sidebar: DoorLockPanel (kontrol + kamera + intercom)
+        └── Config: DoorLockConfig (setup kredensial Tuya)
+```
+
+#### Catatan Teknis
+
+- Stream kamera menggunakan temporary HLS URL dari Tuya Cloud (expire ~5 menit, auto-refresh)
+- Two-way audio menggunakan mekanisme cloud signaling Tuya
+- Data tersimpan di SQLite (`settings` table) — kredensial di-encrypt saat transit
+- Library: `tuya-connector-python` (official Tuya SDK)
+
 ---
 
 ## NVR Event Stream
@@ -199,19 +258,20 @@ home-dashboard/
 ├── start_custom_stream.sh       # Legacy host script
 │
 ├── backend/
-│   ├── app.py            # Flask API: kamera, NVR events, zona, wajah, AI events, siren, performa
+│   ├── app.py            # Flask API: kamera, NVR events, zona, wajah, AI events, siren, doorlock, performa
+│   ├── doorlock.py       # Paloma DLP6202 via Tuya Cloud (lock/unlock, camera, intercom, alerts)
 │   ├── requirements.txt
 │   └── Dockerfile
 │
 ├── frontend/
 │   ├── src/
 │   │   ├── pages/
-│   │   │   ├── Dashboard.jsx    # Halaman utama: CCTV grid, cuaca, smart home, monitoring
-│   │   │   └── ConfigPage.jsx   # Halaman konfigurasi AI (zona, wajah, riwayat, siren, NVR)
+│   │   │   ├── Dashboard.jsx    # Halaman utama: CCTV grid, cuaca, smart home, door lock, monitoring
+│   │   │   └── ConfigPage.jsx   # Halaman konfigurasi AI (zona, wajah, riwayat, siren, door lock, NVR)
 │   │   ├── features/
 │   │   │   ├── cctv/            # CCTVPlayer, AddChannelModal
 │   │   │   ├── detection/       # ZoneEditor, ZoneAlarmSettings, FaceManager, EventHistory
-│   │   │   ├── smarthome/       # SmartControls, NVREventLog, SirenConfig, PerformanceMonitor
+│   │   │   ├── smarthome/       # SmartControls, NVREventLog, SirenConfig, DoorLockPanel, DoorLockConfig, PerformanceMonitor
 │   │   │   └── weather/         # WeatherWidget
 │   │   └── services/api.js      # Semua fungsi fetch ke backend
 │   └── Dockerfile
@@ -256,6 +316,16 @@ home-dashboard/
 | GET | `/api/performance` | Metrik performa server + NVR |
 | GET/POST | `/api/nvr-config` | Kredensial NVR (stream + event) |
 | GET | `/api/nvr-info` | Info perangkat NVR |
+| GET/POST | `/api/doorlock/config` | Konfigurasi door lock (Tuya credentials) |
+| GET | `/api/doorlock/status` | Status door lock (baterai, state) |
+| POST | `/api/doorlock/unlock` | Remote unlock pintu |
+| POST | `/api/doorlock/lock` | Remote lock pintu |
+| POST | `/api/doorlock/camera/stream` | Alokasi stream kamera door lock |
+| POST | `/api/doorlock/camera/stop` | Stop stream kamera |
+| POST | `/api/doorlock/talk/start` | Mulai intercom (speak & listen) |
+| POST | `/api/doorlock/talk/stop` | Stop intercom |
+| GET | `/api/doorlock/alerts` | Riwayat alert door lock |
+| GET | `/api/doorlock/info` | Info perangkat door lock |
 
 ---
 
@@ -304,3 +374,14 @@ docker compose --profile ai up -d analyzer
 docker compose logs analyzer
 ```
 
+**Door Lock "Tidak terhubung"**
+- Pastikan kredensial Tuya sudah benar di ⚙ Konfigurasi → 🚪 Door Lock
+- Pastikan API permissions di Tuya IoT Platform sudah diaktifkan (IoT Core, Smart Lock, IPC)
+- Pastikan Device ID benar dan device online di Smart Life app
+- Cek region sesuai dengan data center yang dipilih saat buat Cloud Project
+- Cek log: `docker compose logs backend | grep DOORLOCK`
+
+**Kamera door lock tidak muncul**
+- Pastikan lock terhubung ke WiFi dan online
+- Stream URL bersifat temporary (~5 menit) — klik ulang "Lihat Kamera" untuk refresh
+- Beberapa device mungkin tidak support streaming via Cloud API — gunakan Smart Life app sebagai fallback

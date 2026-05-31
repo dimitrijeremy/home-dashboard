@@ -3,6 +3,7 @@ import { fetchCameras, addCamera, deleteCamera, fetchStreamStatus, restartStream
 import CCTVPlayer from '../features/cctv/CCTVPlayer'
 import AddChannelModal from '../features/cctv/AddChannelModal'
 import SmartControls from '../features/smarthome/SmartControls'
+import DoorLockPanel from '../features/smarthome/DoorLockPanel'
 import WeatherWidget from '../features/weather/WeatherWidget'
 import PerformanceMonitor from '../features/smarthome/PerformanceMonitor'
 
@@ -333,6 +334,13 @@ export default function Dashboard({ onConfig }) {
                 <div className="section-title">Smart Home</div>
               </div>
               <SmartControls mode={mode} modeLoading={modeLoading} onModeChange={handleModeChange} />
+            </div>
+
+            <div className="section">
+              <div className="section-header">
+                <div className="section-title">🚪 Door Lock</div>
+              </div>
+              <DoorLockPanel />
             </div>
 
             <div className="section">

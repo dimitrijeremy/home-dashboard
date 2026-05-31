@@ -301,3 +301,90 @@ export async function fetchPerformance() {
   if (!res.ok) throw new Error('Failed to fetch performance')
   return res.json()
 }
+
+// ── Door Lock (Paloma DLP6202 via Tuya) ───────────────────────────────────────
+
+export async function fetchDoorlockConfig() {
+  const res = await fetch(url('/api/doorlock/config'))
+  if (!res.ok) throw new Error('Failed to fetch doorlock config')
+  return res.json()
+}
+
+export async function postDoorlockConfig(data) {
+  const res = await fetch(url('/api/doorlock/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to save doorlock config')
+  }
+  return res.json()
+}
+
+export async function fetchDoorlockStatus() {
+  const res = await fetch(url('/api/doorlock/status'))
+  if (!res.ok) throw new Error('Failed to fetch doorlock status')
+  return res.json()
+}
+
+export async function doorlockUnlock() {
+  const res = await fetch(url('/api/doorlock/unlock'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to unlock')
+  }
+  return res.json()
+}
+
+export async function doorlockLock() {
+  const res = await fetch(url('/api/doorlock/lock'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to lock')
+  }
+  return res.json()
+}
+
+export async function doorlockCameraStream() {
+  const res = await fetch(url('/api/doorlock/camera/stream'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to get camera stream')
+  }
+  return res.json()
+}
+
+export async function doorlockCameraStop() {
+  const res = await fetch(url('/api/doorlock/camera/stop'), { method: 'POST' })
+  if (!res.ok) throw new Error('Failed to stop camera stream')
+  return res.json()
+}
+
+export async function doorlockTalkStart() {
+  const res = await fetch(url('/api/doorlock/talk/start'), { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to start talk')
+  }
+  return res.json()
+}
+
+export async function doorlockTalkStop() {
+  const res = await fetch(url('/api/doorlock/talk/stop'), { method: 'POST' })
+  if (!res.ok) throw new Error('Failed to stop talk')
+  return res.json()
+}
+
+export async function fetchDoorlockAlerts(limit = 20) {
+  const res = await fetch(url(`/api/doorlock/alerts?limit=${limit}`))
+  if (!res.ok) throw new Error('Failed to fetch doorlock alerts')
+  return res.json()
+}
+
+export async function fetchDoorlockInfo() {
+  const res = await fetch(url('/api/doorlock/info'))
+  if (!res.ok) throw new Error('Failed to fetch doorlock info')
+  return res.json()
+}
