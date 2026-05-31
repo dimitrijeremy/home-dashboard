@@ -193,3 +193,43 @@ export async function fetchNvrInfo() {
   if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to fetch NVR info')
   return data.info
 }
+
+// ── NVR Guard (Arm/Disarm) ────────────────────────────────────────────────────
+
+export async function fetchNvrGuard() {
+  const res = await fetch(url('/api/nvr-guard'))
+  if (!res.ok) throw new Error('Failed to fetch NVR guard status')
+  return res.json()
+}
+
+export async function postNvrGuard(armed) {
+  const res = await fetch(url('/api/nvr-guard'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ armed }),
+  })
+  if (!res.ok) throw new Error('Failed to set NVR guard')
+  return res.json()
+}
+
+// ── Siren/Speaker Control ─────────────────────────────────────────────────────
+
+export async function triggerSiren(channel = 1) {
+  const res = await fetch(url('/api/siren'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel }),
+  })
+  if (!res.ok) throw new Error('Failed to trigger siren')
+  return res.json()
+}
+
+export async function stopSiren(channel = 1) {
+  const res = await fetch(url('/api/siren/stop'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel }),
+  })
+  if (!res.ok) throw new Error('Failed to stop siren')
+  return res.json()
+}

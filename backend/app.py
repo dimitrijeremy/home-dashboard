@@ -94,6 +94,12 @@ DVR_PASS      = os.getenv("DVR_PASS", "d4$hb0ard-dlt")
 DVR_EVENT_USER = os.getenv("DVR_EVENT_USER") or DVR_USER
 DVR_EVENT_PASS = os.getenv("DVR_EVENT_PASS") or DVR_PASS
 
+# ── Camera Siren/Audio Config (DH-P5AE-PV or similar with speaker) ──────────
+SIREN_CAMERA_HOST = os.getenv("SIREN_CAMERA_HOST", "")  # IP of camera with speaker
+SIREN_CAMERA_USER = os.getenv("SIREN_CAMERA_USER", "") or DVR_USER
+SIREN_CAMERA_PASS = os.getenv("SIREN_CAMERA_PASS", "") or DVR_PASS
+SIREN_ENABLED     = os.getenv("SIREN_ENABLED", "true").lower() in ("1", "true", "yes")
+
 _nvr_events = collections.deque(maxlen=30)
 _nvr_status = {"connected": False, "error": None, "last_event": None}
 _nvr_lock   = threading.Lock()
@@ -1080,9 +1086,106 @@ def _get_current_mode(db):
     return row['value'] if row else 'home'
 
 
+def _trigger_siren(channel: int = 1):
+    """Trigger siren/speaker on camera (DH-P5AE-PV or similar Dahua with built-in speaker).
+    Uses coaxialControl CGI for alarm output and audioOutput for tone playback.
+    """
+    if not SIREN_CAMERA_HOST or not SIREN_ENABLED:
+        print("[SIREN] Skipped — SIREN_CAMERA_HOST not configured or disabled", flush=True)
+        return False
+
+    endpoints = [
+        # Primary: coaxial alarm (works on most Dahua cameras with speaker)
+        f"/cgi-bin/coaxialControl.cgi?action=control&channel={channel}&info[0].Type=Speaker",
+        # Fallback: direct alarm trigger
+        f"/cgi-bin/alarm.cgi?action=start&channel={channel}",
+    ]
+
+    for path in endpoints:
+        try:
+            resp = requests.get(
+                f"http://{SIREN_CAMERA_HOST}{path}",
+                auth=HTTPDigestAuth(SIREN_CAMERA_USER, SIREN_CAMERA_PASS),
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                print(f"[SIREN] Triggered OK via {path}", flush=True)
+                return True
+            print(f"[SIREN] {path} → HTTP {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"[SIREN] {path} error: {e}", flush=True)
+
+    return False
+
+
+def _stop_siren(channel: int = 1):
+    """Stop siren/speaker on camera."""
+    if not SIREN_CAMERA_HOST:
+        return False
+    try:
+        resp = requests.get(
+            f"http://{SIREN_CAMERA_HOST}/cgi-bin/alarm.cgi?action=stop&channel={channel}",
+            auth=HTTPDigestAuth(SIREN_CAMERA_USER, SIREN_CAMERA_PASS),
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[SIREN] stop error: {e}", flush=True)
+        return False
+
+
+def _nvr_guard_set(armed: bool) -> dict:
+    """Set NVR guard mode (arm/disarm).
+    Tries multiple CGI endpoints since Dahua firmware varies.
+    """
+    user, passwd = _get_nvr_event_creds()
+    mode_str = "Start" if armed else "Stop"
+
+    endpoints = [
+        # Primary: configManager approach
+        f"/cgi-bin/configManager.cgi?action=setConfig&Alarm_ARM={mode_str}",
+        # Alternate: SecurityManager
+        f"/cgi-bin/SecurityManager.cgi?action={'arm' if armed else 'disarm'}",
+    ]
+
+    for path in endpoints:
+        try:
+            resp = requests.get(
+                f"http://{DVR_HOST}:{DVR_HTTP_PORT}{path}",
+                auth=HTTPDigestAuth(user, passwd),
+                timeout=8,
+            )
+            if resp.status_code == 200 and "OK" in resp.text:
+                print(f"[NVR-GUARD] {'Armed' if armed else 'Disarmed'} OK via {path}", flush=True)
+                return {"ok": True, "armed": armed}
+            print(f"[NVR-GUARD] {path} → HTTP {resp.status_code}: {resp.text[:100]}", flush=True)
+        except Exception as e:
+            print(f"[NVR-GUARD] {path} error: {e}", flush=True)
+
+    return {"ok": False, "error": "All endpoints failed", "armed": None}
+
+
+def _nvr_guard_get() -> dict:
+    """Get current NVR guard/arm status."""
+    user, passwd = _get_nvr_event_creds()
+    try:
+        resp = requests.get(
+            f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/configManager.cgi?action=getConfig&name=Alarm_ARM",
+            auth=HTTPDigestAuth(user, passwd),
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            body = resp.text.strip()
+            armed = "Start" in body or "true" in body.lower()
+            return {"ok": True, "armed": armed, "raw": body[:200]}
+        return {"ok": False, "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _trigger_alarm(event_body):
     """Called when mode=away and a human detection event arrives.
-    Extend this function to send webhooks, trigger a siren, etc.
+    Triggers siren on camera speaker + logs alarm.
     """
     print(
         f"[ALARM] TRIGGERED – event={event_body.get('event_type')}"
@@ -1091,7 +1194,8 @@ def _trigger_alarm(event_body):
         f", zone={event_body.get('zone_name')}",
         flush=True,
     )
-    # TODO: send webhook / push notification / siren
+    # Trigger camera siren in background thread to not block request
+    threading.Thread(target=_trigger_siren, daemon=True).start()
 
 
 @app.route('/api/mode', methods=['GET'])
@@ -1110,7 +1214,54 @@ def update_mode():
     db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('mode', ?)", (mode,))
     db.commit()
     print(f"[MODE] Changed to '{mode}'", flush=True)
+
+    # Sync NVR guard mode with home/away in background
+    def _sync_nvr():
+        result = _nvr_guard_set(armed=(mode == 'away'))
+        if not result.get('ok'):
+            print(f"[MODE] NVR guard sync failed: {result.get('error')}", flush=True)
+    threading.Thread(target=_sync_nvr, daemon=True).start()
+
     return jsonify({'mode': mode})
+
+
+# ── NVR Guard (Arm/Disarm) ────────────────────────────────────────────────────
+
+@app.route('/api/nvr-guard', methods=['GET'])
+def get_nvr_guard():
+    """Get current NVR armed/disarmed status."""
+    result = _nvr_guard_get()
+    return jsonify(result)
+
+
+@app.route('/api/nvr-guard', methods=['POST'])
+def set_nvr_guard():
+    """Set NVR armed/disarmed status. Body: {"armed": true/false}"""
+    body = request.get_json(silent=True) or {}
+    armed = body.get('armed', True)
+    result = _nvr_guard_set(armed=armed)
+    status_code = 200 if result.get('ok') else 502
+    return jsonify(result), status_code
+
+
+# ── Siren/Speaker Control ─────────────────────────────────────────────────────
+
+@app.route('/api/siren', methods=['POST'])
+def trigger_siren_endpoint():
+    """Trigger siren on camera speaker. Body: {"channel": 1}"""
+    body = request.get_json(silent=True) or {}
+    channel = body.get('channel', 1)
+    ok = _trigger_siren(channel=channel)
+    return jsonify({'ok': ok})
+
+
+@app.route('/api/siren/stop', methods=['POST'])
+def stop_siren_endpoint():
+    """Stop siren on camera speaker."""
+    body = request.get_json(silent=True) or {}
+    channel = body.get('channel', 1)
+    ok = _stop_siren(channel=channel)
+    return jsonify({'ok': ok})
 
 
 # ── Analyzer Events (intake + read) ──────────────────────────────────────────

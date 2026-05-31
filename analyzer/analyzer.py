@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analyzer.py — AI Video Analysis Service
+analyzer.py — AI Video Analysis Service (On-Demand Optimized)
 
 Capabilities:
   - Person detection (YOLOv8n) on RTSP streams from MediaMTX
@@ -8,6 +8,11 @@ Capabilities:
   - Face recognition (InsightFace ArcFace) with enrollment via backend API
   - Saves per-channel snapshots for the UI zone editor
   - Posts detection events to backend /api/analyzer-event
+
+On-Demand Behavior:
+  - When mode=home: only saves snapshots (lightweight), skips AI inference
+  - When mode=away: full AI processing (YOLO + face detection)
+  - Frame rate adapts based on mode for efficiency
 
 Environment variables:
   BACKEND_URL    — default http://backend:5000
@@ -17,6 +22,7 @@ Environment variables:
   FACE_THRESH    — cosine similarity threshold for face match (default 0.40)
   ZONE_CONF      — YOLO confidence threshold (default 0.40)
   COOLDOWN_SECS  — seconds before repeating same event (default 20)
+  SNAPSHOT_EVERY — save snapshot every N frames even without AI (default 30)
 """
 
 import io, json, logging, os, time, threading
@@ -42,21 +48,43 @@ FACE_THRESH   = float(os.getenv("FACE_THRESH", "0.40"))
 ZONE_CONF     = float(os.getenv("ZONE_CONF",   "0.40"))
 COOLDOWN_SECS = int(os.getenv("COOLDOWN_SECS", "20"))
 REFRESH_SECS  = int(os.getenv("REFRESH_SECS",  "30"))
+SNAPSHOT_EVERY = int(os.getenv("SNAPSHOT_EVERY", "30"))  # snapshot-only cadence
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
-# ── Model Loading (done once at startup) ─────────────────────────────────────
-log.info("Loading YOLOv8n model…")
-from ultralytics import YOLO
-yolo = YOLO("yolov8n.pt")
-yolo.fuse()
-log.info("YOLOv8n ready.")
+# ── HTTP Session (connection pooling) ─────────────────────────────────────────
+_session = requests.Session()
+_session.headers.update({"Content-Type": "application/json"})
 
-log.info("Loading InsightFace buffalo_sc…")
-from insightface.app import FaceAnalysis
-face_app = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(320, 320))
-log.info("InsightFace ready.")
+# ── Lazy Model Loading ────────────────────────────────────────────────────────
+# Models are loaded on first use instead of at startup to allow
+# the container to start quickly and serve snapshots immediately.
+_yolo = None
+_face_app = None
+_models_lock = threading.Lock()
+_models_loaded = False
+
+
+def _ensure_models():
+    """Load AI models on first demand (lazy initialization)."""
+    global _yolo, _face_app, _models_loaded
+    if _models_loaded:
+        return
+    with _models_lock:
+        if _models_loaded:
+            return
+        log.info("Loading YOLOv8n model…")
+        from ultralytics import YOLO
+        _yolo = YOLO("yolov8n.pt")
+        _yolo.fuse()
+        log.info("YOLOv8n ready.")
+
+        log.info("Loading InsightFace buffalo_sc…")
+        from insightface.app import FaceAnalysis
+        _face_app = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
+        _face_app.prepare(ctx_id=0, det_size=(320, 320))
+        log.info("InsightFace ready.")
+        _models_loaded = True
 
 # ── Shared State ──────────────────────────────────────────────────────────────
 # {face_id: {"name": str, "embedding": np.ndarray}}
@@ -70,6 +98,21 @@ zone_db_lock  = threading.Lock()
 # {(channel_id, key): last_triggered_ts}
 cooldowns: dict = {}
 cooldown_lock   = threading.Lock()
+
+# Current mode from backend (home/away) — controls AI processing
+_current_mode = "home"
+_mode_lock    = threading.Lock()
+
+
+def _get_mode() -> str:
+    with _mode_lock:
+        return _current_mode
+
+
+def _set_mode(mode: str):
+    global _current_mode
+    with _mode_lock:
+        _current_mode = mode
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,7 +129,7 @@ def _cooling(channel_id: str, key: str) -> bool:
 def _post_event(channel_id: str, camera_name: str, event_type: str,
                 zone_name=None, person_name=None, confidence=None):
     try:
-        requests.post(
+        _session.post(
             f"{BACKEND_URL}/api/analyzer-event",
             json={
                 "channel_id":  channel_id,
@@ -105,13 +148,14 @@ def _post_event(channel_id: str, camera_name: str, event_type: str,
 def _identify_person(frame_bgr: np.ndarray, x1, y1, x2, y2) -> tuple[str | None, float]:
     """Crop person bounding box, run face detection + recognition.
     Returns (name_or_None, confidence). None means no face found or unknown."""
+    _ensure_models()
     h, w = frame_bgr.shape[:2]
     crop = frame_bgr[max(0, y1 - 10):min(h, y2 + 10),
                      max(0, x1 - 10):min(w, x2 + 10)]
     if crop.size == 0:
         return None, 0.0
     try:
-        faces = face_app.get(crop)
+        faces = _face_app.get(crop)
         if not faces:
             return None, 0.0
         emb = faces[0].normed_embedding
@@ -132,7 +176,7 @@ def _identify_person(frame_bgr: np.ndarray, x1, y1, x2, y2) -> tuple[str | None,
 # ── DB Refresh ────────────────────────────────────────────────────────────────
 def refresh_face_db():
     try:
-        r = requests.get(f"{BACKEND_URL}/api/faces?include_photo=1", timeout=10)
+        r = _session.get(f"{BACKEND_URL}/api/faces?include_photo=1", timeout=10)
         if r.status_code != 200:
             return
         faces_data = r.json()
@@ -146,7 +190,8 @@ def refresh_face_db():
                 img_bytes = base64.b64decode(photo_b64)
                 img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                result = face_app.get(img_bgr)
+                _ensure_models()
+                result = _face_app.get(img_bgr)
                 if not result:
                     log.warning(f"No face found in enrolled photo: {fd['name']}")
                     continue
@@ -167,7 +212,7 @@ def refresh_face_db():
 
 def refresh_zone_db():
     try:
-        r = requests.get(f"{BACKEND_URL}/api/zones", timeout=8)
+        r = _session.get(f"{BACKEND_URL}/api/zones", timeout=8)
         if r.status_code != 200:
             return
         new_db: dict = {}
@@ -199,19 +244,41 @@ def refresh_zone_db():
         log.warning(f"refresh_zone_db: {e}")
 
 
+def refresh_mode():
+    """Fetch current home/away mode from backend."""
+    try:
+        r = _session.get(f"{BACKEND_URL}/api/mode", timeout=5)
+        if r.status_code == 200:
+            mode = r.json().get("mode", "home")
+            old = _get_mode()
+            _set_mode(mode)
+            if mode != old:
+                log.info(f"Mode changed: {old} → {mode}")
+                if mode == "away" and not _models_loaded:
+                    log.info("Mode=away — loading AI models on demand…")
+                    _ensure_models()
+    except Exception as e:
+        log.debug(f"refresh_mode: {e}")
+
+
 def periodic_refresh():
-    """Background thread: refresh face + zone DB every REFRESH_SECS."""
+    """Background thread: refresh face + zone DB + mode every REFRESH_SECS."""
     while True:
         time.sleep(REFRESH_SECS)
-        refresh_face_db()
-        refresh_zone_db()
+        refresh_mode()
+        # Only refresh face/zone DBs when in away mode or models are loaded
+        if _get_mode() == "away" or _models_loaded:
+            refresh_face_db()
+            refresh_zone_db()
 
 
 # ── Frame Processing ───────────────────────────────────────────────────────────
 def process_frame(camera_id: int, camera_name: str, channel_id: str,
                   frame: np.ndarray):
+    """Run AI inference on a frame. Only called when mode=away."""
+    _ensure_models()
     h, w = frame.shape[:2]
-    results = yolo(frame, classes=[0], conf=ZONE_CONF, verbose=False)
+    results = _yolo(frame, classes=[0], conf=ZONE_CONF, verbose=False)
     if not results or len(results[0].boxes) == 0:
         return
 
@@ -227,14 +294,20 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
         conf = float(box.conf[0].cpu())
         cx_norm = ((x1 + x2) / 2) / w
         cy_norm = ((y1 + y2) / 2) / h
-        centroid = Point(cx_norm, cy_norm)
         foot_point = Point(cx_norm, min(1.0, y2 / h))
+
+        # Track if face was already identified for this person (avoid duplicate calls)
+        person_identified = False
+        person_name = None
+        face_conf = 0.0
 
         # ── Zone intrusion check ──────────────────────────────────────────
         for zone in cam_zones:
             if zone["poly"].covers(foot_point):
                 if not _cooling(channel_id, f"zone_{zone['id']}"):
-                    person_name, face_conf = _identify_person(frame, x1, y1, x2, y2) if has_face_db else (None, 0.0)
+                    if has_face_db and not person_identified:
+                        person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
+                        person_identified = True
                     log.info(
                         f"[{channel_id}] ZONE '{zone['name']}' "
                         f"person={person_name or 'unknown'} conf={conf:.2f}"
@@ -247,22 +320,21 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
                     )
                 break  # one zone per person per frame is enough
 
-        # ── Face recognition (anywhere in frame) ─────────────────────────
-        if has_face_db:
+        # ── Face recognition (only if not already done above) ─────────────
+        if has_face_db and not person_identified:
             person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
-            if person_name and not _cooling(channel_id, f"face_known_{person_name}"):
-                log.info(f"[{channel_id}] FaceRecognized: {person_name} ({face_conf:.2f})")
-                _post_event(channel_id, camera_name, "FaceRecognized",
-                            person_name=person_name, confidence=face_conf)
-            elif person_name is None and face_conf == 0.0:
-                # no face in crop — skip
-                pass
-            elif person_name is None and face_conf < FACE_THRESH:
-                # face detected but unrecognised
-                if not _cooling(channel_id, f"face_unknown_{int(cx_norm*8)}_{int(cy_norm*8)}"):
-                    log.info(f"[{channel_id}] UnknownFace sim={face_conf:.2f}")
-                    _post_event(channel_id, camera_name, "UnknownFace",
-                                confidence=face_conf)
+            person_identified = True
+
+        if person_identified and person_name and not _cooling(channel_id, f"face_known_{person_name}"):
+            log.info(f"[{channel_id}] FaceRecognized: {person_name} ({face_conf:.2f})")
+            _post_event(channel_id, camera_name, "FaceRecognized",
+                        person_name=person_name, confidence=face_conf)
+        elif person_identified and person_name is None and face_conf > 0 and face_conf < FACE_THRESH:
+            # face detected but unrecognised
+            if not _cooling(channel_id, f"face_unknown_{int(cx_norm*8)}_{int(cy_norm*8)}"):
+                log.info(f"[{channel_id}] UnknownFace sim={face_conf:.2f}")
+                _post_event(channel_id, camera_name, "UnknownFace",
+                            confidence=face_conf)
 
 
 # ── Channel Worker ─────────────────────────────────────────────────────────────
@@ -290,10 +362,15 @@ def channel_worker(camera_id: int, camera_name: str, channel_id: str):
                     break
 
                 frame_count += 1
+                mode = _get_mode()
 
-                # Save snapshot periodically (every PROCESS_EVERY frames = ~0.5–1s)
-                if frame_count % PROCESS_EVERY == 0:
+                # Always save snapshot periodically (lightweight, for UI zone editor)
+                if frame_count % SNAPSHOT_EVERY == 0:
                     cv2.imwrite(snap_path, frame)
+
+                # AI processing only when mode=away and at PROCESS_EVERY cadence
+                if mode == "away" and frame_count % PROCESS_EVERY == 0:
+                    cv2.imwrite(snap_path, frame)  # fresh snap before AI
                     process_frame(camera_id, camera_name, channel_id, frame)
 
         except Exception as e:
@@ -311,7 +388,7 @@ _workers: dict[str, threading.Thread] = {}
 def sync_workers():
     """Start/stop worker threads to match cameras from backend."""
     try:
-        r = requests.get(f"{BACKEND_URL}/api/cameras", timeout=8)
+        r = _session.get(f"{BACKEND_URL}/api/cameras", timeout=8)
         if r.status_code != 200:
             return
         cameras = r.json()
@@ -347,11 +424,12 @@ def sync_workers():
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     log.info(f"Analyzer starting — backend={BACKEND_URL}, mediaMTX={MTX_RTSP_BASE}")
+    log.info(f"On-demand mode: AI models load lazily on first mode=away")
 
     # Initial DB load (wait for backend to be ready)
     for attempt in range(15):
         try:
-            r = requests.get(f"{BACKEND_URL}/api/cameras", timeout=5)
+            r = _session.get(f"{BACKEND_URL}/api/cameras", timeout=5)
             if r.status_code == 200:
                 break
         except Exception:
@@ -359,8 +437,13 @@ def main():
         log.info(f"Waiting for backend… ({attempt + 1}/15)")
         time.sleep(4)
 
-    refresh_face_db()
+    refresh_mode()
     refresh_zone_db()
+
+    # Only load face DB if mode=away (models needed)
+    if _get_mode() == "away":
+        _ensure_models()
+        refresh_face_db()
 
     # Start background refresh thread
     threading.Thread(target=periodic_refresh, daemon=True, name="refresher").start()
@@ -371,8 +454,10 @@ def main():
     # Main loop: re-sync workers every 60s (picks up added/removed cameras)
     while True:
         time.sleep(60)
-        refresh_face_db()
-        refresh_zone_db()
+        refresh_mode()
+        if _get_mode() == "away" or _models_loaded:
+            refresh_face_db()
+            refresh_zone_db()
         sync_workers()
 
 
