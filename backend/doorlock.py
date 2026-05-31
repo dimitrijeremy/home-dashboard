@@ -273,20 +273,6 @@ class TuyaDoorLock:
         if not device_id:
             raise ValueError("device_id not configured")
 
-        params = {
-            'device_id': device_id,
-            'type': '1,2,3,4,5,6,7,8,9',  # All event types
-            'size': limit,
-        }
-        if start_time:
-            params['start_time'] = start_time
-        if end_time:
-            params['end_time'] = end_time
-
-        resp = self._api.get(
-            f'/v1.0/devices/{device_id}/door-lock/temp-password',
-        )
-
         # Get device logs for alerts
         resp = self._api.get(
             f'/v1.0/devices/{device_id}/logs',

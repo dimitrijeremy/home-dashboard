@@ -1697,6 +1697,17 @@ def _init_doorlock():
             print(f"[DOORLOCK] Init failed: {e}", flush=True)
 
 
+def _doorlock_safe_error(e):
+    """Return a safe error message without exposing internal stack traces."""
+    msg = str(e)
+    # Only return the first line (message), not full traceback
+    first_line = msg.split('\n')[0]
+    # Strip file paths and internal details
+    if 'Traceback' in first_line or 'File "' in first_line:
+        return 'Internal error'
+    return first_line[:120]
+
+
 @app.route('/api/doorlock/config', methods=['GET'])
 def get_doorlock_config():
     """Get doorlock configuration (secrets masked)."""
@@ -1756,7 +1767,7 @@ def get_doorlock_status():
         status = _doorlock_instance.get_device_status()
         return jsonify({'ok': True, 'connected': True, 'status': status})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/unlock', methods=['POST'])
@@ -1769,7 +1780,7 @@ def doorlock_unlock():
         _doorlock_instance.unlock()
         return jsonify({'ok': True, 'message': 'Unlock command sent'})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/lock', methods=['POST'])
@@ -1782,7 +1793,7 @@ def doorlock_lock():
         _doorlock_instance.lock()
         return jsonify({'ok': True, 'message': 'Lock command sent'})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/camera/stream', methods=['POST'])
@@ -1795,7 +1806,7 @@ def doorlock_camera_stream():
         stream_info = _doorlock_instance.get_camera_stream()
         return jsonify({'ok': True, 'stream': stream_info})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/camera/stop', methods=['POST'])
@@ -1808,7 +1819,7 @@ def doorlock_camera_stop():
         _doorlock_instance.stop_camera_stream()
         return jsonify({'ok': True})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/talk/start', methods=['POST'])
@@ -1821,7 +1832,7 @@ def doorlock_talk_start():
         session = _doorlock_instance.start_talk()
         return jsonify({'ok': True, 'session': session})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/talk/stop', methods=['POST'])
@@ -1834,7 +1845,7 @@ def doorlock_talk_stop():
         _doorlock_instance.stop_talk()
         return jsonify({'ok': True})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 @app.route('/api/doorlock/alerts', methods=['GET'])
@@ -1857,7 +1868,7 @@ def doorlock_alerts():
             'ok': True,
             'connected': True,
             'alerts': _doorlock_instance.get_local_events(),
-            'error': str(e)[:200],
+            'error': _doorlock_safe_error(e),
         })
 
 
@@ -1871,7 +1882,7 @@ def doorlock_info():
         info = _doorlock_instance.get_device_info()
         return jsonify({'ok': True, 'info': info})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+        return jsonify({'ok': False, 'error': _doorlock_safe_error(e)}), 500
 
 
 _nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")
