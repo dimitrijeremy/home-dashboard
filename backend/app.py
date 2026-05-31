@@ -1527,11 +1527,18 @@ def upload_sound():
     f = request.files['file']
     if not f.filename:
         return jsonify({'error': 'Empty filename'}), 400
-    # Sanitize filename
-    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', f.filename)
+    # Sanitize filename - strip path separators and only allow safe chars
+    base_name = os.path.basename(f.filename)
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', base_name)
     if not safe_name.lower().endswith(('.mp3', '.wav', '.ogg')):
         return jsonify({'error': 'Only .mp3, .wav, .ogg files allowed'}), 400
+    # Prevent path traversal
+    if '..' in safe_name or '/' in safe_name:
+        return jsonify({'error': 'Invalid filename'}), 400
     filepath = os.path.join(SOUND_DIR, safe_name)
+    # Verify resolved path is within SOUND_DIR
+    if not os.path.realpath(filepath).startswith(os.path.realpath(SOUND_DIR)):
+        return jsonify({'error': 'Invalid filename'}), 400
     f.save(filepath)
     return jsonify({'ok': True, 'name': os.path.splitext(safe_name)[0], 'filename': safe_name}), 201
 
@@ -1541,8 +1548,15 @@ def delete_sound(filename):
     """Delete a custom sound file."""
     if filename.startswith('__builtin'):
         return jsonify({'error': 'Cannot delete built-in sounds'}), 400
-    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', filename)
+    # Sanitize and validate filename
+    base_name = os.path.basename(filename)
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', base_name)
+    if '..' in safe_name or '/' in safe_name:
+        return jsonify({'error': 'Invalid filename'}), 400
     filepath = os.path.join(SOUND_DIR, safe_name)
+    # Verify resolved path is within SOUND_DIR
+    if not os.path.realpath(filepath).startswith(os.path.realpath(SOUND_DIR)):
+        return jsonify({'error': 'Invalid filename'}), 400
     if os.path.exists(filepath):
         os.remove(filepath)
     return '', 204
@@ -1550,9 +1564,14 @@ def delete_sound(filename):
 
 # ── Performance Monitoring ────────────────────────────────────────────────────
 
+_perf_lock = threading.Lock()
+_perf_prev_cpu = None
+
+
 @app.route('/api/performance', methods=['GET'])
 def get_performance():
     """Get server and NVR performance metrics."""
+    global _perf_prev_cpu
     import platform
 
     # Server metrics
@@ -1568,16 +1587,17 @@ def get_performance():
         parts = line.split()
         idle = int(parts[4])
         total = sum(int(p) for p in parts[1:])
-        # Store for delta calculation
-        if not hasattr(get_performance, '_prev_cpu'):
-            get_performance._prev_cpu = (idle, total)
-            cpu_percent = 0.0
-        else:
-            prev_idle, prev_total = get_performance._prev_cpu
-            d_idle = idle - prev_idle
-            d_total = total - prev_total
-            cpu_percent = round((1.0 - d_idle / max(d_total, 1)) * 100, 1)
-            get_performance._prev_cpu = (idle, total)
+        # Store for delta calculation (thread-safe)
+        with _perf_lock:
+            if _perf_prev_cpu is None:
+                _perf_prev_cpu = (idle, total)
+                cpu_percent = 0.0
+            else:
+                prev_idle, prev_total = _perf_prev_cpu
+                d_idle = idle - prev_idle
+                d_total = total - prev_total
+                cpu_percent = round((1.0 - d_idle / max(d_total, 1)) * 100, 1)
+                _perf_prev_cpu = (idle, total)
         server_metrics['cpu_percent'] = cpu_percent
     except Exception:
         server_metrics['cpu_percent'] = None
