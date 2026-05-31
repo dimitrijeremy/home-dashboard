@@ -1527,18 +1527,12 @@ def upload_sound():
     f = request.files['file']
     if not f.filename:
         return jsonify({'error': 'Empty filename'}), 400
-    # Sanitize filename - strip path separators and only allow safe chars
-    base_name = os.path.basename(f.filename)
-    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', base_name)
-    if not safe_name.lower().endswith(('.mp3', '.wav', '.ogg')):
+    # Sanitize filename using werkzeug secure_filename + additional restrictions
+    from werkzeug.utils import secure_filename as _secure_filename
+    safe_name = _secure_filename(f.filename)
+    if not safe_name or not safe_name.lower().endswith(('.mp3', '.wav', '.ogg')):
         return jsonify({'error': 'Only .mp3, .wav, .ogg files allowed'}), 400
-    # Prevent path traversal
-    if '..' in safe_name or '/' in safe_name:
-        return jsonify({'error': 'Invalid filename'}), 400
     filepath = os.path.join(SOUND_DIR, safe_name)
-    # Verify resolved path is within SOUND_DIR
-    if not os.path.realpath(filepath).startswith(os.path.realpath(SOUND_DIR)):
-        return jsonify({'error': 'Invalid filename'}), 400
     f.save(filepath)
     return jsonify({'ok': True, 'name': os.path.splitext(safe_name)[0], 'filename': safe_name}), 201
 
@@ -1548,15 +1542,12 @@ def delete_sound(filename):
     """Delete a custom sound file."""
     if filename.startswith('__builtin'):
         return jsonify({'error': 'Cannot delete built-in sounds'}), 400
-    # Sanitize and validate filename
-    base_name = os.path.basename(filename)
-    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', base_name)
-    if '..' in safe_name or '/' in safe_name:
+    # Sanitize filename using werkzeug secure_filename
+    from werkzeug.utils import secure_filename as _secure_filename
+    safe_name = _secure_filename(filename)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
     filepath = os.path.join(SOUND_DIR, safe_name)
-    # Verify resolved path is within SOUND_DIR
-    if not os.path.realpath(filepath).startswith(os.path.realpath(SOUND_DIR)):
-        return jsonify({'error': 'Invalid filename'}), 400
     if os.path.exists(filepath):
         os.remove(filepath)
     return '', 204
