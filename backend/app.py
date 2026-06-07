@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 import requests
 from requests.auth import HTTPDigestAuth
-from flask import Flask, Response, jsonify, request, g, stream_with_context
+from flask import Flask, Response, jsonify, request, g, send_file, stream_with_context
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -36,7 +36,22 @@ DB_PATH  = os.getenv("DB_PATH", "/data/cameras.db")
 CUSTOM_STREAM_SCRIPT = os.getenv("CUSTOM_STREAM_SCRIPT") or os.path.join(APP_DIR, "start_custom_stream.sh")
 FACE_PHOTO_DIR = os.getenv("FACE_PHOTO_DIR", "/data/face_photos")
 SNAPSHOT_DIR   = os.getenv("SNAPSHOT_DIR",   "/data/snapshots")
+NVR_EVENT_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "nvr_events")
+NVR_EVENT_CLIP_DIR = os.path.join(SNAPSHOT_DIR, "nvr_event_clips")
+MTX_RTSP_HOST = os.getenv("MTX_HOST", "mtx")
+MTX_RTSP_PORT = int(os.getenv("RTSP_PORT", "8554"))
+NVR_EVENT_CLIP_SECS = int(os.getenv("NVR_EVENT_CLIP_SECS", "12"))
 CUSTOM_STREAM_PROCS = {}
+NVR_EVENT_PREVIEW_CODES = {
+    "SmartMotionHuman",
+    "VideoMotion",
+    "CrossRegionDetection",
+    "CrossLineDetection",
+    "ZoneIntrusion",
+    "UnknownFace",
+    "FaceRecognized",
+}
+NVR_EVENT_FETCH_LIMIT = 80
 
 
 def _public_stream_url(path_name):
@@ -115,6 +130,210 @@ def _nvr_snapshot_locked():
         "revision": _nvr_revision,
     }
 
+
+def _db_connect():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _parse_channel_number(channel_value=None, index=None):
+    if channel_value is not None:
+        text = str(channel_value).strip()
+        match = re.search(r"(\d+)$", text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+    if index is None:
+        return None
+    try:
+        return int(index) + 1
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_capture_event_snapshot(code, action):
+    return action == "Start" and code in NVR_EVENT_PREVIEW_CODES
+
+
+def _capture_nvr_event_snapshot(channel_number, code):
+    if not channel_number or not DVR_HOST:
+        return None
+
+    os.makedirs(NVR_EVENT_SNAPSHOT_DIR, exist_ok=True)
+    safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", code or "event")[:40]
+    snapshot_name = (
+        f"{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_"
+        f"ch{channel_number}_{safe_code}_{uuid4().hex[:8]}.jpg"
+    )
+    snapshot_path = os.path.join(NVR_EVENT_SNAPSHOT_DIR, snapshot_name)
+    snapshot_url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/snapshot.cgi?action=get&channel={channel_number}"
+
+    last_error = "snapshot unavailable"
+    for user, passwd in _nvr_auth_candidates():
+        try:
+            resp = requests.get(snapshot_url, auth=HTTPDigestAuth(user, passwd), timeout=(5, 10))
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        if resp.status_code == 200 and (resp.headers.get("Content-Type") or "").startswith("image/"):
+            with open(snapshot_path, "wb") as fh:
+                fh.write(resp.content)
+            return snapshot_path
+
+        last_error = f"HTTP {resp.status_code}"
+
+    print(f"[NVR] snapshot capture failed for ch{channel_number}: {last_error}", flush=True)
+    return None
+
+
+def _serialize_nvr_event_row(row):
+    event = {
+        "id": row["id"],
+        "ts": row["ts"],
+        "code": row["code"],
+        "action": row["action"],
+        "index": row["event_index"],
+        "channel_number": row["channel_number"],
+        "source": row["source"],
+    }
+    if row["snapshot_path"]:
+        event["snapshot_url"] = f"/api/nvr-events/{row['id']}/snapshot"
+    if row["clip_path"]:
+        event["clip_url"] = f"/api/nvr-events/{row['id']}/clip"
+    if row["extra_json"]:
+        try:
+            extra = json.loads(row["extra_json"])
+        except Exception:
+            extra = None
+        if isinstance(extra, dict):
+            event.update(extra)
+    return event
+
+
+def _fetch_recent_nvr_events(limit=NVR_EVENT_FETCH_LIMIT):
+    con = _db_connect()
+    try:
+        rows = con.execute(
+            """SELECT id, ts, code, action, event_index, channel_number, source, snapshot_path, clip_path, extra_json
+               FROM nvr_events ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    finally:
+        con.close()
+    return [_serialize_nvr_event_row(row) for row in rows]
+
+
+def _nvr_payload_snapshot(limit=NVR_EVENT_FETCH_LIMIT):
+    with _nvr_lock:
+        status = dict(_nvr_status)
+        revision = _nvr_revision
+    return {
+        "status": status,
+        "events": _fetch_recent_nvr_events(limit=limit),
+        "revision": revision,
+    }
+
+
+def _store_nvr_event(event, snapshot_path=None):
+    extra = {
+        key: value
+        for key, value in event.items()
+        if key not in {"id", "ts", "code", "action", "index", "channel_number", "source", "snapshot_url"}
+    }
+    con = _db_connect()
+    try:
+        cur = con.execute(
+            """INSERT INTO nvr_events
+               (ts, code, action, event_index, channel_number, source, snapshot_path, clip_path, extra_json)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                event["ts"],
+                event["code"],
+                event["action"],
+                int(event.get("index") or 0),
+                event.get("channel_number"),
+                event.get("source") or "nvr",
+                snapshot_path,
+                None,
+                json.dumps(extra) if extra else None,
+            ),
+        )
+        con.commit()
+        event_id = cur.lastrowid
+    finally:
+        con.close()
+    return event_id
+
+
+def _update_nvr_event_clip_path(event_id, clip_path):
+    con = _db_connect()
+    try:
+        con.execute("UPDATE nvr_events SET clip_path=? WHERE id=?", (clip_path, event_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _event_clip_source_url(path_name):
+    safe_path = (path_name or "").strip().strip("/")
+    if not safe_path:
+        return None
+    return f"rtsp://{MTX_RTSP_HOST}:{MTX_RTSP_PORT}/{safe_path}"
+
+
+def _capture_nvr_event_clip(event_id, path_name):
+    source_url = _event_clip_source_url(path_name)
+    if not source_url:
+        return
+
+    os.makedirs(NVR_EVENT_CLIP_DIR, exist_ok=True)
+    clip_path = os.path.join(NVR_EVENT_CLIP_DIR, f"event_{event_id}_{uuid4().hex[:8]}.mp4")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        source_url,
+        "-t",
+        str(NVR_EVENT_CLIP_SECS),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        clip_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=NVR_EVENT_CLIP_SECS + 20)
+    except Exception as exc:
+        if os.path.exists(clip_path):
+            os.remove(clip_path)
+        print(f"[NVR] clip capture failed for event {event_id}: {exc}", flush=True)
+        return
+
+    _update_nvr_event_clip_path(event_id, clip_path)
+    with _nvr_lock:
+        _nvr_bump_locked()
+
+
+def _start_event_clip_capture(event_id, path_name):
+    if not path_name:
+        return
+    threading.Thread(
+        target=_capture_nvr_event_clip,
+        args=(event_id, path_name),
+        daemon=True,
+        name=f"nvr-clip-{event_id}",
+    ).start()
+
 # ── DB helpers ──────────────────────────────────────────────
 
 def get_db():
@@ -142,6 +361,12 @@ def ensure_detection_columns(con):
     existing = {row[1] for row in con.execute("PRAGMA table_info(detection_events)")}
     if "alarm_triggered" not in existing:
         con.execute("ALTER TABLE detection_events ADD COLUMN alarm_triggered INTEGER NOT NULL DEFAULT 0")
+
+
+def ensure_nvr_event_columns(con):
+    existing = {row[1] for row in con.execute("PRAGMA table_info(nvr_events)")}
+    if "clip_path" not in existing:
+        con.execute("ALTER TABLE nvr_events ADD COLUMN clip_path TEXT")
 
 
 def build_rtsp_source(rtsp_url, channel):
@@ -321,6 +546,20 @@ def init_db():
         )
     """)
     con.execute("""
+        CREATE TABLE IF NOT EXISTS nvr_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             TEXT    NOT NULL,
+            code           TEXT    NOT NULL,
+            action         TEXT    NOT NULL,
+            event_index    INTEGER NOT NULL DEFAULT 0,
+            channel_number INTEGER,
+            source         TEXT    NOT NULL DEFAULT 'nvr',
+            snapshot_path  TEXT,
+            clip_path      TEXT,
+            extra_json     TEXT
+        )
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -333,6 +572,7 @@ def init_db():
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_user', ?)" , (DVR_EVENT_USER,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_pass', ?)" , (DVR_EVENT_PASS,))
     ensure_detection_columns(con)
+    ensure_nvr_event_columns(con)
     sync_camera_rows(con)
     con.commit()
     restore_custom_streams(con)
@@ -820,12 +1060,24 @@ def _nvr_event_worker():
                                     pass
                         if not ev_code or not ev_action:
                             continue
+                        channel_number = _parse_channel_number(index=ev_index)
                         event = {
                             "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "code": ev_code,
                             "action": ev_action,
                             "index": ev_index,
+                            "channel_number": channel_number,
+                            "source": "nvr",
+                            "path_name": f"ch{channel_number}" if channel_number else None,
                         }
+                        snapshot_path = None
+                        if _should_capture_event_snapshot(ev_code, ev_action):
+                            snapshot_path = _capture_nvr_event_snapshot(channel_number, ev_code)
+                        event["id"] = _store_nvr_event(event, snapshot_path=snapshot_path)
+                        if snapshot_path:
+                            event["snapshot_url"] = f"/api/nvr-events/{event['id']}/snapshot"
+                        if _should_capture_event_snapshot(ev_code, ev_action):
+                            _start_event_clip_capture(event["id"], event.get("path_name"))
                         with _nvr_lock:
                             _nvr_events.appendleft(event)
                             _nvr_status["last_event"] = event["ts"]
@@ -840,8 +1092,7 @@ def _nvr_event_worker():
 
 @app.route('/api/nvr-events', methods=['GET'])
 def get_nvr_events():
-    with _nvr_lock:
-        return jsonify(_nvr_snapshot_locked())
+    return jsonify(_nvr_payload_snapshot())
 
 
 @app.route('/api/nvr-events/stream', methods=['GET'])
@@ -849,20 +1100,21 @@ def stream_nvr_events():
     def generate():
         with _nvr_cond:
             last_revision = _nvr_revision
-            initial_payload = json.dumps(_nvr_snapshot_locked())
+        initial_payload = json.dumps(_nvr_payload_snapshot())
         yield f"data: {initial_payload}\n\n"
 
         while True:
             with _nvr_cond:
                 _nvr_cond.wait(timeout=25)
                 if _nvr_revision == last_revision:
-                    payload = None
+                    should_refresh = False
                 else:
                     last_revision = _nvr_revision
-                    payload = json.dumps(_nvr_snapshot_locked())
-            if payload is None:
+                    should_refresh = True
+            if not should_refresh:
                 yield ": keepalive\n\n"
                 continue
+            payload = json.dumps(_nvr_payload_snapshot())
             yield f"data: {payload}\n\n"
 
     return Response(
@@ -1120,6 +1372,17 @@ def receive_analyzer_event():
     body = request.get_json(silent=True) or {}
     ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     db = get_db()
+    extra_payload = None
+    extra_raw = body.get('extra_json')
+    if isinstance(extra_raw, dict):
+        extra_payload = extra_raw
+    elif isinstance(extra_raw, str) and extra_raw.strip():
+        try:
+            parsed = json.loads(extra_raw)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            extra_payload = parsed
 
     # Check alarm condition: mode=away + human detection event
     current_mode = _get_current_mode(db)
@@ -1153,11 +1416,26 @@ def receive_analyzer_event():
         'code':           event_type,
         'action':         'Start',
         'index':          0,
+        'channel_number': _parse_channel_number(channel_value=body.get('channel_id')),
+        'source':         'analyzer',
+        'path_name':      body.get('channel_id', ''),
         'zone_name':      body.get('zone_name'),
         'person':         body.get('person_name'),
         'channel':        body.get('channel_id', ''),
         'alarm':          bool(alarm),
     }
+    if extra_payload:
+        event.update(extra_payload)
+    if event['channel_number']:
+        event['index'] = max(event['channel_number'] - 1, 0)
+    snapshot_path = None
+    if _should_capture_event_snapshot(event_type, 'Start'):
+        snapshot_path = _capture_nvr_event_snapshot(event['channel_number'], event_type)
+    event['id'] = _store_nvr_event(event, snapshot_path=snapshot_path)
+    if snapshot_path:
+        event['snapshot_url'] = f"/api/nvr-events/{event['id']}/snapshot"
+    if _should_capture_event_snapshot(event_type, 'Start'):
+        _start_event_clip_capture(event['id'], event.get('path_name'))
     with _nvr_lock:
         _nvr_events.appendleft(event)
         _nvr_status['last_event'] = ts
@@ -1201,6 +1479,24 @@ def camera_snapshot(cam_id):
     with open(snap_path, 'rb') as f:
         data = f.read()
     return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache'}
+
+
+@app.route('/api/nvr-events/<int:event_id>/snapshot', methods=['GET'])
+def get_nvr_event_snapshot(event_id):
+    row = get_db().execute("SELECT snapshot_path FROM nvr_events WHERE id=?", (event_id,)).fetchone()
+    if not row or not row['snapshot_path'] or not os.path.exists(row['snapshot_path']):
+        return jsonify({'error': 'snapshot not found'}), 404
+    with open(row['snapshot_path'], 'rb') as fh:
+        data = fh.read()
+    return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=300'}
+
+
+@app.route('/api/nvr-events/<int:event_id>/clip', methods=['GET'])
+def get_nvr_event_clip(event_id):
+    row = get_db().execute("SELECT clip_path FROM nvr_events WHERE id=?", (event_id,)).fetchone()
+    if not row or not row['clip_path'] or not os.path.exists(row['clip_path']):
+        return jsonify({'error': 'clip not found'}), 404
+    return send_file(row['clip_path'], mimetype='video/mp4', conditional=True, max_age=300)
 
 
 _nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")

@@ -1,8 +1,28 @@
 import React, { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 
+const DEFAULT_VIDEO_SIZE = { width: 1920, height: 1080 }
+
 function normalizeStreamUrl(src) {
   return src
+}
+
+function parseZonePoints(zone) {
+  if (Array.isArray(zone?.points)) return zone.points
+  if (typeof zone?.points_json !== 'string') return []
+  try {
+    const parsed = JSON.parse(zone.points_json)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function toSvgPoints(points, videoSize) {
+  return points
+    .filter((point) => Array.isArray(point) && point.length >= 2)
+    .map(([x, y]) => `${Math.round(x * videoSize.width)},${Math.round(y * videoSize.height)}`)
+    .join(' ')
 }
 
 // mediamtx always outputs LL-HLS v10 (EXT-X-PART-INF, EXT-X-SERVER-CONTROL,
@@ -61,7 +81,7 @@ const HLS_CONFIG = {
 
 const MAX_RETRIES = 5
 
-export default function CCTVPlayer({ src, name, onRemove, removable }) {
+export default function CCTVPlayer({ src, name, zones = [], showZones = false, onRemove, removable }) {
   const videoRef = useRef(null)
   const hlsRef   = useRef(null)
   const retryRef = useRef(null)
@@ -72,6 +92,7 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
   const [muted, setMuted]   = useState(true)
   const [errorMsg, setErrorMsg] = useState(null)
   const [retryKey, setRetryKey] = useState(0)
+  const [videoSize, setVideoSize] = useState(DEFAULT_VIDEO_SIZE)
 
   useEffect(() => {
     const video = videoRef.current
@@ -84,6 +105,7 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
 
     function cleanup() {
       clearTimeout(retryRef.current)
+      video.onloadedmetadata = null
       video.onloadeddata = null
       video.oncanplay = null
       video.oncanplaythrough = null
@@ -116,12 +138,24 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
         video.play().catch(() => {})
       }
 
+      const syncVideoSize = () => {
+        if (!video.videoWidth || !video.videoHeight) return
+        setVideoSize((current) => {
+          if (current.width === video.videoWidth && current.height === video.videoHeight) {
+            return current
+          }
+          return { width: video.videoWidth, height: video.videoHeight }
+        })
+      }
+
       const markLive = () => {
         if (deadRef.current) return
+        syncVideoSize()
         recoverRef.current = 0
         setStatus('live')
       }
 
+      video.onloadedmetadata = syncVideoSize
       video.onloadeddata = requestPlay
       video.oncanplay = requestPlay
       video.oncanplaythrough = requestPlay
@@ -233,6 +267,12 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
     document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.()
   }
 
+  const overlayZones = showZones
+    ? zones
+        .map((zone) => ({ ...zone, parsedPoints: parseZonePoints(zone) }))
+        .filter((zone) => zone.parsedPoints.length >= 3)
+    : []
+
   return (
     <div className="cam-card">
       <div className="cam-header">
@@ -263,6 +303,29 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
           autoPlay
           playsInline
         />
+        {overlayZones.length > 0 && (
+          <div className="cam-zone-overlay">
+            <svg viewBox={`0 0 ${videoSize.width} ${videoSize.height}`} preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+              {overlayZones.map((zone, index) => {
+                const labelPoint = zone.parsedPoints[0]
+                return (
+                  <g key={zone.id || `${zone.name}-${index}`}>
+                    <polygon className="cam-zone-polygon" points={toSvgPoints(zone.parsedPoints, videoSize)} />
+                    {labelPoint && (
+                      <text
+                        className="cam-zone-label"
+                        x={Math.round(labelPoint[0] * videoSize.width)}
+                        y={Math.max(26, Math.round(labelPoint[1] * videoSize.height) - 10)}
+                      >
+                        {zone.name}
+                      </text>
+                    )}
+                  </g>
+                )
+              })}
+            </svg>
+          </div>
+        )}
         {status === 'loading' && (
           <div className="cam-overlay"><span className="cam-spinner" /></div>
         )}

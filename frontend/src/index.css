@@ -48,6 +48,7 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .view-mode-btn{background:none;border:none;color:var(--text-muted);cursor:pointer;padding:4px 8px;border-radius:4px;font-size:.85rem;line-height:1;transition:all .15s}
 .view-mode-btn:hover{color:var(--text);background:var(--surface2)}
 .view-mode-btn.active{background:var(--surface2);color:var(--accent)}
+.zone-visibility-btn.is-active{background:rgba(59,130,246,.14);border-color:rgba(59,130,246,.45);color:var(--accent)}
 
 /* ── Section ── */
 .section{margin-bottom:32px}
@@ -75,11 +76,16 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .weather-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px 20px;display:flex;align-items:center;gap:20px}
 .weather-icon{font-size:2.4rem;line-height:1;flex-shrink:0}
 .weather-info{flex:1}
+.weather-select-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.weather-select-label{font-size:.64rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted)}
+.weather-location-select{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:var(--r-sm);padding:4px 8px;font-size:.72rem;max-width:140px}
+.weather-location-select:focus{outline:none;border-color:var(--accent)}
 .weather-temp{font-size:1.7rem;font-weight:700;line-height:1}
 .weather-temp sup{font-size:.8rem;font-weight:400;color:var(--text-dim)}
 .weather-desc{font-size:.82rem;color:var(--text-dim);margin-top:2px}
 .weather-location{font-size:.72rem;color:var(--text-muted);margin-top:4px;display:flex;align-items:center;gap:4px}
-.weather-details{display:flex;flex-direction:column;gap:4px;font-size:.75rem;color:var(--text-dim);text-align:right}
+.weather-details{display:flex;flex-direction:row;align-items:center;gap:12px;font-size:.75rem;color:var(--text-dim);text-align:right;flex-wrap:wrap}
+.weather-details span{white-space:nowrap}
 .weather-loading{color:var(--text-muted);font-size:.85rem;padding:16px}
 
 /* ── CCTV Grid ── */
@@ -100,6 +106,10 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .btn-icon:hover{color:var(--text)}
 .cam-video{width:100%;height:0;padding-bottom:56.25%;position:relative;background:#000}
 .cam-video video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.cam-zone-overlay{position:absolute;inset:0;pointer-events:none;z-index:2}
+.cam-zone-overlay svg{width:100%;height:100%;display:block}
+.cam-zone-polygon{fill:rgba(59,130,246,.16);stroke:#93c5fd;stroke-width:4;vector-effect:non-scaling-stroke}
+.cam-zone-label{fill:#f8fafc;font-size:26px;font-weight:700;paint-order:stroke;stroke:rgba(2,6,23,.9);stroke-width:10;stroke-linejoin:round}
 .cam-error{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:#000;color:var(--text-muted);font-size:.8rem}
 .cam-error-icon{font-size:2rem;opacity:.4}
 .cam-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}
@@ -116,7 +126,7 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .btn-red:hover{background:rgba(239,68,68,.2)}
 
 /* ── Modal ── */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:1200;padding:20px;backdrop-filter:blur(4px)}
 .modal{background:var(--surface);border:1px solid var(--border2);border-radius:var(--r);padding:24px;width:100%;max-width:440px}
 .modal-title{font-size:1rem;font-weight:700;margin-bottom:18px}
 .modal label{display:block;font-size:.75rem;font-weight:600;color:var(--text-dim);margin-bottom:5px;margin-top:14px;text-transform:uppercase;letter-spacing:.06em}
@@ -162,7 +172,8 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .nvr-active-badge{font-size:.65rem;font-weight:700;padding:2px 7px;border-radius:20px;background:rgba(245,158,11,.15);color:var(--yellow);border:1px solid rgba(245,158,11,.3);animation:pulse 1.5s infinite}
 .nvr-event-empty{font-size:.75rem;color:var(--text-muted);text-align:center;padding:8px 0}
 .nvr-event-list{display:flex;flex-direction:column;gap:3px;max-height:230px;overflow-y:auto;padding-right:2px}
-.nvr-event-row{display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:4px;border-left:2px solid transparent}
+.nvr-event-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;border-left:2px solid transparent;cursor:default}
+.nvr-event-row.has-preview{cursor:pointer}
 .nvr-ev-start{background:rgba(245,158,11,.07);border-left-color:var(--yellow)}
 .nvr-ev-stop{background:rgba(100,116,139,.05);border-left-color:var(--border2)}
 .nvr-ev-code{flex:1;font-size:.74rem;font-weight:600;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -172,6 +183,33 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .nvr-action-start{color:var(--yellow)}
 .nvr-action-stop{color:var(--text-muted)}
 .nvr-ev-time{font-size:.67rem;color:var(--text-muted);white-space:nowrap;min-width:60px;text-align:right}
+.nvr-ev-meta{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;font-size:.64rem;color:var(--text-muted)}
+.nvr-ev-meta span{padding:1px 5px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid var(--border)}
+.nvr-ev-preview-tag{color:var(--accent);border-color:rgba(59,130,246,.35)!important;background:rgba(59,130,246,.12)!important}
+.nvr-event-hover-preview{position:absolute;left:calc(100% + 10px);top:-6px;width:220px;background:rgba(10,14,26,.96);border:1px solid var(--border2);border-radius:10px;padding:8px;box-shadow:0 12px 30px rgba(0,0,0,.45);z-index:30}
+.nvr-event-hover-preview img{width:100%;display:block;border-radius:6px;border:1px solid var(--border);background:#000}
+.nvr-event-hover-caption{margin-top:6px;font-size:.65rem;color:var(--text-muted);text-align:center}
+.nvr-preview-overlay{z-index:1600}
+.nvr-preview-modal{max-width:960px;padding:18px 18px 16px}
+.nvr-preview-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
+.nvr-preview-title{font-size:1rem;font-weight:700}
+.nvr-preview-subtitle{font-size:.78rem;color:var(--text-muted);margin-top:3px}
+.nvr-preview-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;font-size:.75rem;color:var(--text-muted);flex-wrap:wrap}
+.nvr-preview-mode-buttons{display:flex;gap:8px;flex-wrap:wrap}
+.nvr-preview-mode-buttons .btn.is-active{background:rgba(59,130,246,.14);border-color:rgba(59,130,246,.45);color:var(--accent)}
+.nvr-preview-toolbar input{flex:1}
+.nvr-preview-stage{background:#05070d;border:1px solid var(--border);border-radius:10px;padding:10px;overflow:auto;max-height:60vh;min-height:320px}
+.nvr-preview-stage.is-pannable{cursor:grab;user-select:none}
+.nvr-preview-stage.is-panning{cursor:grabbing}
+.nvr-preview-image-wrap{min-height:280px;display:flex;align-items:flex-start;justify-content:center;overflow:visible}
+.nvr-preview-canvas{position:relative;flex:0 0 auto;min-width:100%;margin:0 auto}
+.nvr-preview-canvas img{display:block;width:100%;max-width:none;border-radius:8px;border:1px solid var(--border);background:#000;pointer-events:none}
+.nvr-preview-zone-svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.nvr-preview-zone-svg polygon{fill:rgba(59,130,246,.12);stroke:#60a5fa;stroke-width:0.7}
+.nvr-preview-detection-box{position:absolute;border:3px solid #f59e0b;box-shadow:0 0 0 9999px rgba(245,158,11,.08) inset;border-radius:6px;pointer-events:none}
+.nvr-preview-video{display:block;width:100%;max-height:56vh;border-radius:8px;background:#000}
+.nvr-preview-meta-panel{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;font-size:.72rem;color:var(--text-muted)}
+.nvr-preview-meta-panel span{padding:4px 8px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid var(--border)}
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar-track{background:var(--bg)}
@@ -186,6 +224,11 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 @media(max-width:640px){
   .controls-grid{grid-template-columns:repeat(2,1fr)}
   .weather-details{display:none}
+   .weather-select-row{align-items:flex-start;flex-direction:column}
+   .weather-location-select{max-width:none;width:100%}
+   .nvr-event-row{grid-template-columns:minmax(0,1fr) auto auto}
+   .nvr-ev-time{grid-column:2 / 4}
+   .nvr-event-hover-preview{display:none}
 }
 
 /* ═══════════════════════════════════════════════
@@ -238,6 +281,7 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
    FACE MANAGER
    ═══════════════════════════════════════════════ */
 .face-manager{display:flex;flex-direction:column;gap:14px}
+.face-runtime-note{font-size:.76rem;line-height:1.45;color:var(--text-dim);background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);border-radius:var(--r-sm);padding:10px 12px}
 .face-manager-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .face-manager-header h3{font-size:.9rem;font-weight:700;margin:0}
 .face-enroll-form{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px;display:flex;flex-direction:column;gap:12px}

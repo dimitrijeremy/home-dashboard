@@ -26,9 +26,21 @@ const WMO = {
 }
 
 // Default: Jakarta
-const DEFAULT_LAT  = -6.2088
-const DEFAULT_LON  = 106.8456
-const DEFAULT_CITY = 'Jakarta'
+const WEATHER_STORAGE_KEY = 'hd_weather_city'
+const LOCATIONS = [
+  { id: 'jakarta',   label: 'Jakarta',   lat: -6.2088,  lon: 106.8456 },
+  { id: 'bandung',   label: 'Bandung',   lat: -6.9175,  lon: 107.6191 },
+  { id: 'surabaya',  label: 'Surabaya',  lat: -7.2575,  lon: 112.7521 },
+  { id: 'denpasar',  label: 'Denpasar',  lat: -8.6500,  lon: 115.2167 },
+  { id: 'medan',     label: 'Medan',     lat: 3.5952,   lon: 98.6722 },
+  { id: 'makassar',  label: 'Makassar',  lat: -5.1477,  lon: 119.4327 },
+]
+
+function loadLocationId() {
+  if (typeof window === 'undefined') return LOCATIONS[0].id
+  const saved = localStorage.getItem(WEATHER_STORAGE_KEY)
+  return LOCATIONS.some(item => item.id === saved) ? saved : LOCATIONS[0].id
+}
 
 function wmoInfo(code) {
   const entry = WMO[code]
@@ -45,13 +57,17 @@ function windDir(deg) {
 }
 
 export default function WeatherWidget() {
+  const [locationId, setLocationId] = useState(loadLocationId)
   const [data,    setData]    = useState(null)
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState(null)
 
+  const location = LOCATIONS.find(item => item.id === locationId) ?? LOCATIONS[0]
+
   useEffect(() => {
-    const lat  = DEFAULT_LAT
-    const lon  = DEFAULT_LON
+    const controller = new AbortController()
+    const lat  = location.lat
+    const lon  = location.lon
     const url  = `https://api.open-meteo.com/v1/forecast`
                 + `?latitude=${lat}&longitude=${lon}`
                 + `&current_weather=true`
@@ -59,7 +75,10 @@ export default function WeatherWidget() {
                 + `&timezone=Asia%2FJakarta`
                 + `&forecast_days=1`
 
-    fetch(url, { signal: AbortSignal.timeout(8000) })
+    setLoading(true)
+    setError(null)
+
+    fetch(url, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]) })
       .then(r => { if (!r.ok) throw new Error('fetch failed'); return r.json() })
       .then(json => {
         const cw  = json.current_weather
@@ -76,10 +95,18 @@ export default function WeatherWidget() {
         setLoading(false)
       })
       .catch(e => {
+        if (e.name === 'AbortError') return
         setError('Gagal memuat cuaca')
         setLoading(false)
       })
-  }, [])
+
+    return () => controller.abort()
+  }, [location.id, location.lat, location.lon])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(WEATHER_STORAGE_KEY, locationId)
+  }, [locationId])
 
   if (loading) return (
     <div className="weather-card weather-loading">⏳ Memuat cuaca...</div>
@@ -94,12 +121,25 @@ export default function WeatherWidget() {
     <div className="weather-card">
       <div className="weather-icon">{icon}</div>
       <div className="weather-info">
+        <div className="weather-select-row">
+          <label htmlFor="weather-city" className="weather-select-label">Lokasi</label>
+          <select
+            id="weather-city"
+            className="weather-location-select"
+            value={locationId}
+            onChange={(event) => setLocationId(event.target.value)}
+          >
+            {LOCATIONS.map((item) => (
+              <option key={item.id} value={item.id}>{item.label}</option>
+            ))}
+          </select>
+        </div>
         <div className="weather-temp">
           {data.temp}<sup>°C</sup>
         </div>
         <div className="weather-desc">{label}</div>
         <div className="weather-location">
-          📍 {DEFAULT_CITY} · Terasa {data.feels}°C
+          📍 {location.label} · Terasa {data.feels}°C
         </div>
       </div>
       <div className="weather-details">

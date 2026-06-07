@@ -1,9 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { fetchCameras, addCamera, deleteCamera, fetchStreamStatus, restartStream, restartAllStreams, fetchMode, postMode } from '../services/api'
+import { fetchCameras, addCamera, deleteCamera, fetchStreamStatus, restartStream, restartAllStreams, fetchMode, postMode, fetchZones } from '../services/api'
 import CCTVPlayer from '../features/cctv/CCTVPlayer'
 import AddChannelModal from '../features/cctv/AddChannelModal'
 import SmartControls from '../features/smarthome/SmartControls'
 import WeatherWidget from '../features/weather/WeatherWidget'
+
+const SHOW_ZONES_STORAGE_KEY = 'hd_show_zones'
+
+function loadShowZones() {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(SHOW_ZONES_STORAGE_KEY) === '1'
+}
 
 // ── Perimeter Alert Toasts ─────────────────────────────────────────────────
 const ALERT_CODES = new Set(['ZoneIntrusion', 'SmartMotionHuman', 'AlarmLocal', 'VideoMotion'])
@@ -212,9 +219,11 @@ const VIEW_MODES = [
 
 export default function Dashboard({ onConfig }) {
   const [cams,        setCams]        = useState([])
+  const [zones,       setZones]       = useState([])
   const [error,       setError]       = useState(null)
   const [showModal,   setShowModal]   = useState(false)
   const [showStatus,  setShowStatus]  = useState(false)
+  const [showZones,   setShowZones]   = useState(loadShowZones)
   const [viewMode,    setViewMode]    = useState('grid2')
   const [mode,        setMode]        = useState('home')
   const [modeLoading, setModeLoading] = useState(false)
@@ -261,8 +270,15 @@ export default function Dashboard({ onConfig }) {
 
   useEffect(() => { reload() }, [])
   useEffect(() => {
+    fetchZones().then(setZones).catch(() => {})
+  }, [])
+  useEffect(() => {
     fetchMode().then(d => setMode(d.mode)).catch(() => {})
   }, [])
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(SHOW_ZONES_STORAGE_KEY, showZones ? '1' : '0')
+  }, [showZones])
 
   const handleModeChange = (newMode) => {
     setModeLoading(true)
@@ -283,6 +299,12 @@ export default function Dashboard({ onConfig }) {
   }
 
   const cols = VIEW_MODES.find(m => m.id === viewMode)?.cols ?? 2
+  const enabledZonesByCamera = zones.reduce((acc, zone) => {
+    if (!zone.enabled) return acc
+    if (!acc[zone.camera_id]) acc[zone.camera_id] = []
+    acc[zone.camera_id].push(zone)
+    return acc
+  }, {})
 
   return (
     <div className="app">
@@ -353,6 +375,13 @@ export default function Dashboard({ onConfig }) {
                     </button>
                   ))}
                 </div>
+                <button
+                  className={`btn btn-ghost zone-visibility-btn${showZones ? ' is-active' : ''}`}
+                  onClick={() => setShowZones(v => !v)}
+                  title={showZones ? 'Sembunyikan overlay zona' : 'Tampilkan overlay zona'}
+                >
+                  {showZones ? 'Zona ON' : 'Zona OFF'}
+                </button>
                 <StreamStatusPanel
                   cams={cams}
                   open={showStatus}
@@ -375,6 +404,8 @@ export default function Dashboard({ onConfig }) {
                     key={cam.id}
                     src={cam.stream_url}
                     name={cam.name}
+                    zones={enabledZonesByCamera[cam.id] || []}
+                    showZones={showZones}
                     removable={!cam.builtin}
                     onRemove={() => handleRemove(cam.id)}
                   />

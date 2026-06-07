@@ -66,6 +66,10 @@ export default function FaceManager() {
         )}
       </div>
 
+      <div className="face-runtime-note">
+        Face detection berjalan saat service AI analyzer aktif. Jika belum ada wajah terdaftar, sistem tetap bisa menandai wajah asing, tetapi event wajah dikenal baru muncul setelah minimal satu wajah didaftarkan.
+      </div>
+
       {error && (
         <div className="face-error">{error}</div>
       )}
@@ -126,7 +130,7 @@ export default function FaceManager() {
         <div className="face-loading">Memuat…</div>
       ) : faces.length === 0 ? (
         <div className="face-empty">
-          Belum ada wajah terdaftar. Klik "Daftarkan Wajah" untuk menambahkan.
+          Belum ada wajah terdaftar. Klik "Daftarkan Wajah" untuk menambahkan agar event FaceRecognized bisa muncul.
         </div>
       ) : (
         <div className="face-grid">

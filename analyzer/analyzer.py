@@ -84,7 +84,7 @@ def _cooling(channel_id: str, key: str) -> bool:
 
 
 def _post_event(channel_id: str, camera_name: str, event_type: str,
-                zone_name=None, person_name=None, confidence=None):
+                zone_name=None, person_name=None, confidence=None, extra_json=None):
     try:
         requests.post(
             f"{BACKEND_URL}/api/analyzer-event",
@@ -95,6 +95,7 @@ def _post_event(channel_id: str, camera_name: str, event_type: str,
                 "zone_name":   zone_name,
                 "person_name": person_name,
                 "confidence":  round(confidence, 3) if confidence else None,
+                "extra_json":  json.dumps(extra_json) if extra_json else None,
             },
             timeout=4,
         )
@@ -102,31 +103,68 @@ def _post_event(channel_id: str, camera_name: str, event_type: str,
         log.warning(f"post_event failed: {e}")
 
 
-def _identify_person(frame_bgr: np.ndarray, x1, y1, x2, y2) -> tuple[str | None, float]:
-    """Crop person bounding box, run face detection + recognition.
-    Returns (name_or_None, confidence). None means no face found or unknown."""
+def _extract_face_embedding(frame_bgr: np.ndarray, x1, y1, x2, y2) -> np.ndarray | None:
+    """Crop person bounding box and return the first detected face embedding."""
     h, w = frame_bgr.shape[:2]
     crop = frame_bgr[max(0, y1 - 10):min(h, y2 + 10),
                      max(0, x1 - 10):min(w, x2 + 10)]
     if crop.size == 0:
-        return None, 0.0
+        return None
     try:
         faces = face_app.get(crop)
         if not faces:
-            return None, 0.0
-        emb = faces[0].normed_embedding
-        best_name, best_sim = None, 0.0
-        with face_db_lock:
-            for data in face_db.values():
-                sim = float(np.dot(emb, data["embedding"]))
-                if sim > best_sim:
-                    best_sim, best_name = sim, data["name"]
-        if best_sim >= FACE_THRESH:
-            return best_name, best_sim
-        return None, best_sim   # face found but unrecognised
+            return None
+        return faces[0].normed_embedding
     except Exception as e:
-        log.debug(f"identify_person: {e}")
-        return None, 0.0
+        log.debug(f"extract_face_embedding: {e}")
+        return None
+
+
+def _match_face_embedding(embedding: np.ndarray) -> tuple[str | None, float]:
+    best_name, best_sim = None, 0.0
+    with face_db_lock:
+        for data in face_db.values():
+            sim = float(np.dot(embedding, data["embedding"]))
+            if sim > best_sim:
+                best_sim, best_name = sim, data["name"]
+    if best_name and best_sim >= FACE_THRESH:
+        return best_name, best_sim
+    return None, best_sim
+
+
+def _identify_person(frame_bgr: np.ndarray, x1, y1, x2, y2) -> tuple[bool, str | None, float]:
+    """Run face detection on a person crop and optionally match against enrolled faces."""
+    embedding = _extract_face_embedding(frame_bgr, x1, y1, x2, y2)
+    if embedding is None:
+        return False, None, 0.0
+    with face_db_lock:
+        has_face_db = len(face_db) > 0
+    if not has_face_db:
+        return True, None, 0.0
+    name, similarity = _match_face_embedding(embedding)
+    return True, name, similarity
+
+
+def _unknown_face_cooldown_key(channel_id: str, cx_norm: float, cy_norm: float) -> str:
+    return f"face_unknown_{channel_id}_{int(cx_norm * 8)}_{int(cy_norm * 8)}"
+
+
+def _emit_face_event(channel_id: str, camera_name: str, event_extra: dict,
+                     cx_norm: float, cy_norm: float, face_found: bool,
+                     person_name: str | None, face_conf: float):
+    if not face_found:
+        return
+    if person_name and not _cooling(channel_id, f"face_known_{person_name}"):
+        log.info(f"[{channel_id}] FaceRecognized: {person_name} ({face_conf:.2f})")
+        _post_event(channel_id, camera_name, "FaceRecognized",
+                    person_name=person_name, confidence=face_conf,
+                    extra_json=event_extra)
+        return
+    if not person_name and not _cooling(channel_id, _unknown_face_cooldown_key(channel_id, cx_norm, cy_norm)):
+        log.info(f"[{channel_id}] UnknownFace sim={face_conf:.2f}")
+        _post_event(channel_id, camera_name, "UnknownFace",
+                    confidence=face_conf,
+                    extra_json=event_extra)
 
 
 # ── DB Refresh ────────────────────────────────────────────────────────────────
@@ -185,6 +223,7 @@ def refresh_zone_db():
                 new_db.setdefault(cam_id, []).append({
                     "id":   z["id"],
                     "name": z["name"],
+                    "points": pts,
                     "poly": poly,
                 })
             except Exception as e:
@@ -218,10 +257,6 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
     with zone_db_lock:
         cam_zones = list(zone_db.get(camera_id, []))
 
-    has_face_db: bool
-    with face_db_lock:
-        has_face_db = len(face_db) > 0
-
     for box in results[0].boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
         conf = float(box.conf[0].cpu())
@@ -229,12 +264,24 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
         cy_norm = ((y1 + y2) / 2) / h
         centroid = Point(cx_norm, cy_norm)
         foot_point = Point(cx_norm, min(1.0, y2 / h))
+        bbox_norm = {
+            "left": max(0.0, min(1.0, x1 / w)),
+            "top": max(0.0, min(1.0, y1 / h)),
+            "right": max(0.0, min(1.0, x2 / w)),
+            "bottom": max(0.0, min(1.0, y2 / h)),
+        }
+        event_extra = {
+            "detection_box": bbox_norm,
+            "frame_size": {"width": w, "height": h},
+        }
+        face_found, person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
+        if face_found:
+            event_extra["face_detected"] = True
 
         # ── Zone intrusion check ──────────────────────────────────────────
         for zone in cam_zones:
             if zone["poly"].covers(foot_point):
                 if not _cooling(channel_id, f"zone_{zone['id']}"):
-                    person_name, face_conf = _identify_person(frame, x1, y1, x2, y2) if has_face_db else (None, 0.0)
                     log.info(
                         f"[{channel_id}] ZONE '{zone['name']}' "
                         f"person={person_name or 'unknown'} conf={conf:.2f}"
@@ -244,25 +291,24 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
                         zone_name=zone["name"],
                         person_name=person_name,
                         confidence=conf,
+                        extra_json={
+                            **event_extra,
+                            "zone_points": zone.get("points") or [],
+                        },
                     )
                 break  # one zone per person per frame is enough
 
         # ── Face recognition (anywhere in frame) ─────────────────────────
-        if has_face_db:
-            person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
-            if person_name and not _cooling(channel_id, f"face_known_{person_name}"):
-                log.info(f"[{channel_id}] FaceRecognized: {person_name} ({face_conf:.2f})")
-                _post_event(channel_id, camera_name, "FaceRecognized",
-                            person_name=person_name, confidence=face_conf)
-            elif person_name is None and face_conf == 0.0:
-                # no face in crop — skip
-                pass
-            elif person_name is None and face_conf < FACE_THRESH:
-                # face detected but unrecognised
-                if not _cooling(channel_id, f"face_unknown_{int(cx_norm*8)}_{int(cy_norm*8)}"):
-                    log.info(f"[{channel_id}] UnknownFace sim={face_conf:.2f}")
-                    _post_event(channel_id, camera_name, "UnknownFace",
-                                confidence=face_conf)
+        _emit_face_event(
+            channel_id,
+            camera_name,
+            event_extra,
+            cx_norm,
+            cy_norm,
+            face_found,
+            person_name,
+            face_conf,
+        )
 
 
 # ── Channel Worker ─────────────────────────────────────────────────────────────
