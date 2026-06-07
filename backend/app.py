@@ -14,8 +14,8 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from datetime import datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, quote as urlquote, unquote as urlunquote
 from uuid import uuid4
 import requests
 from requests.auth import HTTPDigestAuth
@@ -166,6 +166,15 @@ def build_rtsp_source(rtsp_url, channel):
     if parts.scheme not in {"rtsp", "rtsps", "rtsp+http", "rtsps+http", "rtsp+ws", "rtsps+ws"}:
         raise ValueError("unsupported rtsp_url scheme")
 
+    # URL-encode credentials so special chars (e.g. '$') are safe in shell commands
+    raw_user = urlunquote(parts.username or '')
+    raw_pass = urlunquote(parts.password or '')
+    enc_user = urlquote(raw_user, safe='')
+    enc_pass = urlquote(raw_pass, safe='')
+    port_part = f':{parts.port}' if parts.port else ''
+    new_netloc = f'{enc_user}:{enc_pass}@{parts.hostname}{port_part}'
+    parts = parts._replace(netloc=new_netloc)
+
     pairs = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "channel"]
     pairs.insert(0, ("channel", channel_str))
 
@@ -208,28 +217,37 @@ def _kill_orphan_custom_streams(path_name):
             continue
 
 
+def _shell_single_quote(s):
+    """Wrap string in single quotes for safe embedding in shell command strings."""
+    return "'" + s.replace("'", "'\\''" ) + "'"
+
+
 def stop_custom_stream(path_name):
-    entry = CUSTOM_STREAM_PROCS.pop(path_name, None)
-    if entry:
-        proc = entry["proc"]
-        log_handle = entry["log"]
-        if proc.poll() is None:
-            proc.terminate()
-        log_handle.close()
+    CUSTOM_STREAM_PROCS.pop(path_name, None)
+    try:
+        requests.delete(
+            f"{MTX_API_URL}/v3/config/paths/delete/{path_name}",
+            timeout=5,
+        )
+    except Exception:
+        pass
     _kill_orphan_custom_streams(path_name)
 
 
 def launch_custom_stream(path_name, rtsp_url, channel):
+    """Configure MTX path with runOnInit so MTX container's OpenSSL ffmpeg handles
+    the RTSP pull — avoids GnuTLS hostname-verification failures for Dahua cameras."""
     stop_custom_stream(path_name)
     source_url = build_rtsp_source(rtsp_url, channel)
-    log_handle = open(f"/tmp/{path_name}.log", "ab")
-    proc = subprocess.Popen(
-        [CUSTOM_STREAM_SCRIPT, source_url, path_name],
-        cwd=APP_DIR,
-        stdout=log_handle,
-        stderr=log_handle,
+    # Single-quote the URL so any remaining shell-special chars (e.g. '&') are safe
+    cmd = f"/app/start_custom_stream.sh {_shell_single_quote(source_url)} {path_name}"
+    resp = requests.post(
+        f"{MTX_API_URL}/v3/config/paths/add/{path_name}",
+        json={"runOnInit": cmd, "runOnInitRestart": True},
+        timeout=5,
     )
-    CUSTOM_STREAM_PROCS[path_name] = {"proc": proc, "log": log_handle}
+    resp.raise_for_status()
+    CUSTOM_STREAM_PROCS[path_name] = {"via_mtx": True}
 
 
 def restore_custom_streams(con):
@@ -332,6 +350,17 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS nvr_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT    NOT NULL,
+            code        TEXT    NOT NULL,
+            action      TEXT    NOT NULL DEFAULT '',
+            event_index INTEGER NOT NULL DEFAULT 0,
+            extra_json  TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_nvr_events_ts ON nvr_events(ts)")
     # Seed default settings
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('mode', 'home')")
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_stream_user', ?)" , (DVR_USER,))
@@ -448,10 +477,36 @@ def delete_camera(cam_id):
     return '', 204
 
 
+@app.route('/api/cameras/<int:cam_id>', methods=['GET'])
+def get_camera(cam_id):
+    row = get_db().execute(
+        "SELECT id, name, stream_url, builtin, rtsp_url, channel FROM cameras WHERE id=?",
+        (cam_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    data = dict(row)
+    rtsp = (data.get('rtsp_url') or '').strip()
+    if rtsp and '://' in rtsp:
+        try:
+            parts = urlsplit(rtsp)
+            data['ip'] = parts.hostname or ''
+            data['port'] = parts.port or 554
+            data['username'] = urlunquote(parts.username or '')
+            data['use_tls'] = parts.scheme in ('rtsps', 'rtsps+http')
+        except Exception:
+            pass
+    data.pop('rtsp_url', None)   # don't expose raw URL with credentials
+    return jsonify(data)
+
+
 @app.route('/api/cameras/<int:cam_id>', methods=['PATCH'])
 def update_camera(cam_id):
     db = get_db()
-    row = db.execute("SELECT id FROM cameras WHERE id=?", (cam_id,)).fetchone()
+    row = db.execute(
+        "SELECT id, name, stream_url, rtsp_url, channel, builtin FROM cameras WHERE id=?",
+        (cam_id,)
+    ).fetchone()
     if not row:
         return jsonify({'error': 'not found'}), 404
 
@@ -463,18 +518,158 @@ def update_camera(cam_id):
             return jsonify({'error': 'name cannot be empty'}), 400
         fields.append('name=?'); vals.append(name)
     if 'stream_url' in body:
-        url = body['stream_url'].strip()
-        if not url.startswith('http'):
+        surl = body['stream_url'].strip()
+        if not surl.startswith('http'):
             return jsonify({'error': 'stream_url must start with http'}), 400
-        fields.append('stream_url=?'); vals.append(url)
+        fields.append('stream_url=?'); vals.append(surl)
+
+    restart_stream = False
+    if not row['builtin'] and any(k in body for k in ('ip', 'port', 'username', 'password', 'channel')):
+        current_rtsp = (row['rtsp_url'] or '').strip()
+        if current_rtsp and '://' in current_rtsp:
+            parts = urlsplit(current_rtsp)
+            new_ip      = body.get('ip',       parts.hostname or '').strip()
+            new_port    = int(body.get('port', parts.port or 554))
+            new_user    = body.get('username', urlunquote(parts.username or ''))
+            raw_pass    = body.get('password') or ''
+            new_pass    = raw_pass if raw_pass else urlunquote(parts.password or '')
+            new_channel = int(body.get('channel', row['channel'] or 1))
+            scheme      = parts.scheme or 'rtsps'
+            new_netloc  = f"{new_user}:{new_pass}@{new_ip}:{new_port}"
+            new_rtsp    = urlunsplit((scheme, new_netloc, parts.path or '/cam/realmonitor',
+                                     parts.query or 'subtype=0&unicast=true&proto=Onvif&tls=true', ''))
+            fields.append('rtsp_url=?');  vals.append(new_rtsp)
+            fields.append('channel=?');   vals.append(new_channel)
+            restart_stream = True
 
     if fields:
         vals.append(cam_id)
         db.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", vals)
         db.commit()
 
+    if restart_stream:
+        updated_row = db.execute(
+            "SELECT stream_url, rtsp_url, channel FROM cameras WHERE id=?", (cam_id,)
+        ).fetchone()
+        path_name = extract_custom_path_name(updated_row['stream_url'])
+        if path_name and updated_row['rtsp_url'] and updated_row['channel']:
+            try:
+                launch_custom_stream(path_name, updated_row['rtsp_url'], updated_row['channel'])
+            except Exception as e:
+                print(f"[STREAM] restart failed for {path_name}: {e}", flush=True)
+
     updated = db.execute("SELECT id, name, stream_url, builtin FROM cameras WHERE id=?", (cam_id,)).fetchone()
     return jsonify(dict(updated))
+
+
+def _ptz_target(cam_id):
+    """Return (host, http_port, user, password, channel_1indexed) for PTZ commands."""
+    row = get_db().execute(
+        "SELECT builtin, rtsp_url, channel FROM cameras WHERE id=?", (cam_id,)
+    ).fetchone()
+    if not row:
+        return None
+
+    if row['builtin']:
+        # Built-in NVR channel — 0-indexed for NVR multi-channel
+        ch0 = max(0, int(row['channel'] or 1) - 1)
+        user, pswd = _get_nvr_event_creds()
+        return DVR_HOST, DVR_HTTP_PORT, user, pswd, ch0
+
+    # Custom IP camera — extract host/creds from stored rtsp_url
+    rtsp = (row['rtsp_url'] or '').strip()
+    if not rtsp:
+        return None
+    try:
+        parts = urlsplit(rtsp if '://' in rtsp else f'rtsp://{rtsp}')
+        host = parts.hostname or ''
+        port = 80
+        user = urlunquote(parts.username or '') or DVR_USER
+        pswd = urlunquote(parts.password or '') or DVR_PASS
+        # Standalone IP cameras use channel=1 (1-indexed), NVR uses 0-indexed
+        return host, port, user, pswd, 1
+    except Exception:
+        return None
+
+
+@app.route('/api/cameras/<int:cam_id>/ptz-check', methods=['GET'])
+def camera_ptz_check(cam_id):
+    """Check if camera/NVR channel supports PTZ by probing Dahua CGI."""
+    target = _ptz_target(cam_id)
+    if not target:
+        return jsonify({'supported': False, 'reason': 'camera not found'}), 404
+
+    host, port, user, pswd, ch = target
+    if not host:
+        return jsonify({'supported': False, 'reason': 'no host configured'})
+
+    auth = HTTPDigestAuth(user, pswd)
+    base_url = f"http://{host}:{port}/cgi-bin/ptz.cgi"
+
+    # Try getStatus first (NVR-style)
+    for probe_action, probe_params in [
+        ('getStatus', {'action': 'getStatus', 'channel': ch}),
+        # Fallback: probe with a real start+stop for cameras that reject getStatus
+        ('start',     {'action': 'start', 'code': 'Up', 'arg1': 0, 'arg2': 1, 'arg3': 0, 'channel': ch}),
+    ]:
+        try:
+            resp = requests.get(base_url, params=probe_params, auth=auth, timeout=5, verify=False)
+            if resp.status_code == 200:
+                # If it was a start command, immediately stop
+                if probe_action == 'start':
+                    try:
+                        requests.get(base_url, params={'action': 'stop', 'code': 'Up',
+                                                       'arg1': 0, 'arg2': 0, 'arg3': 0, 'channel': ch},
+                                     auth=auth, timeout=3, verify=False)
+                    except Exception:
+                        pass
+                return jsonify({'supported': True})
+            if resp.status_code == 400:
+                # 400 may mean wrong params for getStatus but camera has PTZ — try next probe
+                continue
+        except Exception as e:
+            return jsonify({'supported': False, 'reason': str(e)[:120]})
+
+    return jsonify({'supported': False, 'reason': f'HTTP {resp.status_code}'})
+
+
+@app.route('/api/cameras/<int:cam_id>/ptz', methods=['POST'])
+def camera_ptz(cam_id):
+    """Send a PTZ command to Dahua NVR/camera via CGI HTTP API."""
+    body = request.get_json(silent=True) or {}
+    action = body.get('action', 'start')   # 'start' | 'stop'
+    code   = body.get('code', 'Up')        # Up Down Left Right ZoomTele ZoomWide
+    speed  = int(body.get('speed', 4))
+
+    # Validate inputs to prevent injection
+    if action not in ('start', 'stop'):
+        return jsonify({'error': 'invalid action'}), 400
+    valid_codes = {'Up', 'Down', 'Left', 'Right', 'ZoomTele', 'ZoomWide', 'FocusNear', 'FocusFar'}
+    if code not in valid_codes:
+        return jsonify({'error': 'invalid code'}), 400
+    if not 1 <= speed <= 8:
+        speed = 4
+
+    target = _ptz_target(cam_id)
+    if not target:
+        return jsonify({'error': 'camera not found'}), 404
+
+    host, port, user, pswd, ch = target
+    if not host:
+        return jsonify({'error': 'DVR_HOST not configured'}), 503
+
+    try:
+        resp = requests.get(
+            f"http://{host}:{port}/cgi-bin/ptz.cgi",
+            params={'action': action, 'channel': ch, 'code': code,
+                    'arg1': 0, 'arg2': speed, 'arg3': 0},
+            auth=HTTPDigestAuth(user, pswd),
+            timeout=5,
+            verify=False,
+        )
+        return jsonify({'ok': resp.ok, 'status': resp.status_code, 'body': resp.text[:200]})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 502
 
 
 @app.route('/api/stream-status', methods=['GET'])
@@ -643,6 +838,129 @@ def _parse_dahua_kv_text(raw_text):
     return pairs
 
 
+def _dahua_time(value, fallback):
+    raw = (value or '').strip()
+    if not raw:
+        return fallback.strftime('%Y-%m-%d %H:%M:%S')
+    raw = raw.replace('T', ' ').replace('Z', '').strip()
+    if len(raw) == 16:
+        raw += ':00'
+    return raw[:19]
+
+
+def _nvr_cgi_get(path, params=None, timeout=8):
+    if not DVR_HOST:
+        raise RuntimeError('NVR host is not configured')
+
+    last_error = 'NVR request failed'
+    url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}{path}"
+    for user, passwd in _nvr_auth_candidates():
+        try:
+            resp = requests.get(
+                url,
+                params=params or {},
+                auth=HTTPDigestAuth(user, passwd),
+                timeout=(5, timeout),
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        if resp.status_code == 200:
+            return resp.text
+
+        last_error = f"HTTP {resp.status_code}: {resp.text[:120]}"
+
+    raise RuntimeError(last_error)
+
+
+def _extract_finder_id(raw_text):
+    for key, value in _parse_dahua_kv_text(raw_text).items():
+        if key.lower() in {'result', 'object', 'id'} and value:
+            return value
+    match = re.search(r'(\d+)', raw_text or '')
+    return match.group(1) if match else ''
+
+
+def _parse_media_file_items(raw_text):
+    items = {}
+    for key, value in _parse_dahua_kv_text(raw_text).items():
+        match = re.match(r'(?:items|infos|files)\[(\d+)\]\.(.+)', key, re.I)
+        if not match:
+            continue
+        item = items.setdefault(int(match.group(1)), {})
+        item[match.group(2)] = value
+    return [items[idx] for idx in sorted(items)]
+
+
+def _find_nvr_playback_events(channel, start_time, end_time, event_code='', limit=80):
+    finder = ''
+    try:
+        finder = _extract_finder_id(_nvr_cgi_get('/cgi-bin/mediaFileFind.cgi', {
+            'action': 'factory.create',
+        }))
+        if not finder:
+            raise RuntimeError('NVR did not return a media finder id')
+
+        params = {
+            'action': 'findFile',
+            'object': finder,
+            'condition.Channel': int(channel),
+            'condition.StartTime': start_time,
+            'condition.EndTime': end_time,
+            'condition.Types[0]': 'dav',
+            'condition.Flags[0]': 'Event',
+        }
+        if event_code:
+            params['condition.Events[0]'] = event_code
+
+        find_text = _nvr_cgi_get('/cgi-bin/mediaFileFind.cgi', params, timeout=20)
+        if 'false' in find_text.lower() and 'true' not in find_text.lower():
+            raise RuntimeError(find_text.strip()[:160] or 'NVR rejected playback search')
+
+        found = []
+        while len(found) < limit:
+            text = _nvr_cgi_get('/cgi-bin/mediaFileFind.cgi', {
+                'action': 'findNextFile',
+                'object': finder,
+                'count': min(32, limit - len(found)),
+            }, timeout=20)
+            batch = _parse_media_file_items(text)
+            if not batch:
+                break
+            found.extend(batch)
+
+        rows = []
+        for idx, item in enumerate(found[:limit]):
+            item_channel = item.get('Channel') or item.get('channel') or channel
+            try:
+                item_channel = int(item_channel)
+            except (TypeError, ValueError):
+                item_channel = channel
+            file_path = item.get('FilePath') or item.get('Path') or item.get('FileName') or ''
+            rows.append({
+                'id': idx,
+                'channel': item_channel,
+                'start_time': item.get('StartTime') or item.get('Start') or '',
+                'end_time': item.get('EndTime') or item.get('End') or '',
+                'event': item.get('Event') or item.get('Events') or event_code or '',
+                'type': item.get('Type') or item.get('FileType') or 'dav',
+                'size': item.get('Length') or item.get('Size') or '',
+                'path': file_path,
+            })
+        return rows
+    finally:
+        if finder:
+            for action in ('close', 'destroy'):
+                try:
+                    _nvr_cgi_get('/cgi-bin/mediaFileFind.cgi', {
+                        'action': action,
+                        'object': finder,
+                    }, timeout=5)
+                except Exception:
+                    pass
+
+
 def _build_nvr_info_payload():
     system_info = _parse_dahua_kv_text(_nvr_cgi_text('/cgi-bin/magicBox.cgi?action=getSystemInfo'))
     device_type = _parse_dahua_kv_text(_nvr_cgi_text('/cgi-bin/magicBox.cgi?action=getDeviceType'))
@@ -687,6 +1005,7 @@ def _build_nvr_info_payload():
         index = int(match.group(1)) + 1
         channels.append({'index': index, 'name': value})
     channels.sort(key=lambda item: item['index'])
+    channel_total = len(channels) or 4
 
     with _nvr_lock:
         event_status = dict(_nvr_status)
@@ -707,6 +1026,12 @@ def _build_nvr_info_payload():
             'disks': disk_rows,
         },
         'channels': channels,
+        'capabilities': {
+            'event_stream': True,
+            'event_history': True,
+            'event_playback_search': True,
+            'channel_count': channel_total,
+        },
         'events': event_status,
     }
 
@@ -831,7 +1156,19 @@ def _nvr_event_worker():
                             "code": ev_code,
                             "action": ev_action,
                             "index": ev_index,
+                            "channel": ev_index + 1,
                         }
+                        # Persist to DB (fire-and-forget, ignore errors)
+                        try:
+                            db = sqlite3.connect(DB_PATH)
+                            db.execute(
+                                "INSERT INTO nvr_events (ts, code, action, event_index) VALUES (?,?,?,?)",
+                                (event["ts"], ev_code, ev_action, ev_index),
+                            )
+                            db.commit()
+                            db.close()
+                        except Exception as _db_err:
+                            print(f"[NVR] DB write error: {_db_err}", flush=True)
                         with _nvr_lock:
                             _nvr_events.appendleft(event)
                             _nvr_status["last_event"] = event["ts"]
@@ -848,6 +1185,75 @@ def _nvr_event_worker():
 def get_nvr_events():
     with _nvr_lock:
         return jsonify(_nvr_snapshot_locked())
+
+
+@app.route('/api/nvr-events/history', methods=['GET'])
+def get_nvr_events_history():
+    """Return persisted NVR events with optional filters.
+    Query params: from (ISO), to (ISO), code (event code), limit (int, default 200)
+    """
+    from_ts = request.args.get('from')
+    to_ts   = request.args.get('to')
+    code    = request.args.get('code')
+    try:
+        limit = min(int(request.args.get('limit', 200)), 1000)
+    except (ValueError, TypeError):
+        limit = 200
+
+    query = "SELECT id, ts, code, action, event_index AS channel FROM nvr_events WHERE 1=1"
+    params = []
+    if from_ts:
+        query += " AND ts >= ?"
+        params.append(from_ts)
+    if to_ts:
+        query += " AND ts <= ?"
+        params.append(to_ts)
+    if code:
+        query += " AND code = ?"
+        params.append(code)
+    query += " ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+
+    try:
+        rows = get_db().execute(query, params).fetchall()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/nvr-events/playback', methods=['GET'])
+def get_nvr_events_playback():
+    """Search NVR-recorded event clips via Dahua mediaFileFind.cgi.
+    Query params: channel (1-based, -1 all), from, to, code, limit.
+    """
+    now = datetime.now()
+    from_time = _dahua_time(request.args.get('from'), now - timedelta(hours=24))
+    to_time = _dahua_time(request.args.get('to'), now)
+    code = (request.args.get('code') or '').strip()
+    try:
+        channel = int(request.args.get('channel', '-1'))
+    except (TypeError, ValueError):
+        channel = -1
+    try:
+        limit = min(max(int(request.args.get('limit', 80)), 1), 300)
+    except (ValueError, TypeError):
+        limit = 80
+
+    try:
+        rows = _find_nvr_playback_events(channel, from_time, to_time, code, limit)
+        return jsonify({
+            'ok': True,
+            'query': {
+                'channel': channel,
+                'from': from_time,
+                'to': to_time,
+                'code': code,
+                'limit': limit,
+            },
+            'events': rows,
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
 
 
 @app.route('/api/nvr-events/stream', methods=['GET'])

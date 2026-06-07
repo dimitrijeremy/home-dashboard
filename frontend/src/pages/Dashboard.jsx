@@ -236,13 +236,14 @@ export default function Dashboard({ onConfig }) {
       es = new EventSource('/api/nvr-events/stream')
       es.onmessage = (e) => {
         try {
-          const event = JSON.parse(e.data)
+          const payload = JSON.parse(e.data)
+          const event = payload?.events?.[0] || payload
           if (ALERT_CODES.has(event.code) && event.action === 'Start') {
             const id = `${Date.now()}-${Math.random()}`
             const alert = {
               id,
               code: event.code,
-              channel: event.channel,
+              channel: event.channel || (Number.isInteger(event.index) ? event.index + 1 : ''),
               time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
             }
             setAlerts(prev => [alert, ...prev].slice(0, 5))
@@ -282,6 +283,10 @@ export default function Dashboard({ onConfig }) {
   const handleRemove = async (id) => {
     await deleteCamera(id)
     setCams(prev => prev.filter(c => c.id !== id))
+  }
+
+  const handleRename = (id, newName) => {
+    setCams(prev => prev.map(c => c.id === id ? { ...c, name: newName } : c))
   }
 
   const cols = VIEW_MODES.find(m => m.id === viewMode)?.cols ?? 2
@@ -391,8 +396,10 @@ export default function Dashboard({ onConfig }) {
                     key={cam.id}
                     src={cam.stream_url}
                     name={cam.name}
+                    camId={cam.id}
                     removable={!cam.builtin}
                     onRemove={() => handleRemove(cam.id)}
+                    onRename={handleRename}
                   />
                 ))}
               </div>

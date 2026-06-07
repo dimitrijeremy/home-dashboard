@@ -31,6 +31,47 @@ export async function deleteCamera(id) {
   }
 }
 
+export async function updateCamera(id, body) {
+  const res = await fetch(url(`/api/cameras/${id}`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to update camera')
+  }
+  return res.json()
+}
+
+export async function getCamera(id) {
+  const res = await fetch(url(`/api/cameras/${id}`))
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to fetch camera')
+  }
+  return res.json()
+}
+
+export async function ptzCheck(id) {
+  const res = await fetch(url(`/api/cameras/${id}/ptz-check`))
+  if (!res.ok) return { supported: false }
+  return res.json()
+}
+
+export async function ptzCommand(id, action, code, speed = 4) {
+  const res = await fetch(url(`/api/cameras/${id}/ptz`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, code, speed }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'PTZ command failed')
+  }
+  return res.json()
+}
+
 export async function fetchStreamStatus() {
   const res = await fetch(url('/api/stream-status'))
   if (!res.ok) throw new Error('Failed to fetch stream status')
@@ -59,6 +100,30 @@ export async function fetchNvrEvents() {
   const res = await fetch(url('/api/nvr-events'))
   if (!res.ok) throw new Error('Failed to fetch NVR events')
   return res.json()
+}
+
+export async function fetchNvrHistory({ from, to, code, limit = 200 } = {}) {
+  const params = new URLSearchParams()
+  if (from)  params.set('from', from)
+  if (to)    params.set('to', to)
+  if (code)  params.set('code', code)
+  params.set('limit', String(limit))
+  const res = await fetch(url(`/api/nvr-events/history?${params.toString()}`))
+  if (!res.ok) throw new Error('Failed to fetch NVR history')
+  return res.json()
+}
+
+export async function fetchNvrPlaybackEvents({ from, to, code, channel = -1, limit = 80 } = {}) {
+  const params = new URLSearchParams()
+  if (from) params.set('from', from)
+  if (to) params.set('to', to)
+  if (code) params.set('code', code)
+  params.set('channel', String(channel))
+  params.set('limit', String(limit))
+  const res = await fetch(url(`/api/nvr-events/playback?${params.toString()}`))
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to fetch NVR playback events')
+  return data
 }
 
 export function nvrEventsStreamUrl() {

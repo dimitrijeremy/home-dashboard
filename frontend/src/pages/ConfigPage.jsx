@@ -215,6 +215,8 @@ export default function ConfigPage({ onBack }) {
                       <div className="nvr-info-kv"><span>Status</span><strong className={nvrInfo.events.connected ? 'nvr-ok' : 'nvr-bad'}>{nvrInfo.events.connected ? 'Tersambung' : 'Terputus'}</strong></div>
                       <div className="nvr-info-kv"><span>Last Event</span><strong>{nvrInfo.events.last_event || '—'}</strong></div>
                       <div className="nvr-info-kv"><span>Error</span><strong>{nvrInfo.events.error || '—'}</strong></div>
+                      <div className="nvr-info-kv"><span>Playback Event</span><strong className={nvrInfo.capabilities?.event_playback_search ? 'nvr-ok' : 'nvr-bad'}>{nvrInfo.capabilities?.event_playback_search ? 'Siap dicari' : 'Tidak tersedia'}</strong></div>
+                      <div className="nvr-info-kv"><span>Channel</span><strong>{nvrInfo.capabilities?.channel_count || nvrInfo.channels.length || '—'}</strong></div>
                     </div>
 
                     <div className="nvr-info-card">

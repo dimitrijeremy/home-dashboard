@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
+import { ptzCheck, ptzCommand, updateCamera, getCamera } from '../../services/api'
 
 function normalizeStreamUrl(src) {
   return src
@@ -59,19 +60,236 @@ const HLS_CONFIG = {
   },
 }
 
-const MAX_RETRIES = 5
+const MAX_RETRIES = 12   // ~24s of 2s retries before giving up
 
-export default function CCTVPlayer({ src, name, onRemove, removable }) {
+// ── PTZ Control Panel ──────────────────────────────────────────────────────
+function PTZPanel({ camId, capable }) {
+  const [error,    setError]  = useState(null)
+  const pressing              = useRef(null)
+
+  const send = (code, action = 'start') => {
+    setError(null)
+    ptzCommand(camId, action, code).catch(e => setError(e.message))
+  }
+
+  const startPress = (code) => {
+    send(code, 'start')
+    pressing.current = code
+  }
+  const stopPress = () => {
+    if (pressing.current) { send(pressing.current, 'stop'); pressing.current = null }
+  }
+
+  if (capable === null) return (
+    <div className="ptz-overlay">
+      <span style={{ fontSize: '.7rem', color: 'var(--text-muted)' }}>Memeriksa PTZ...</span>
+    </div>
+  )
+  if (capable === false) return (
+    <div className="ptz-overlay">
+      <span style={{ fontSize: '.7rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>PTZ tidak didukung kamera ini</span>
+    </div>
+  )
+
+  const btn = (label, code, style = {}) => (
+    <button
+      className="btn-icon"
+      style={{ fontSize: '1rem', padding: '6px 10px', borderRadius: 4, ...style }}
+      onMouseDown={() => startPress(code)}
+      onMouseUp={stopPress}
+      onMouseLeave={stopPress}
+      onTouchStart={e => { e.preventDefault(); startPress(code) }}
+      onTouchEnd={stopPress}
+      title={code}
+    >{label}</button>
+  )
+
+  return (
+    <div className="ptz-overlay">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,36px)', gap: 4, justifyContent: 'center' }}>
+        <div />{btn('▲', 'Up')}<div />
+        {btn('◀', 'Left')}{btn('⏹', 'Up', { visibility: 'hidden' })}{btn('▶', 'Right')}
+        <div />{btn('▼', 'Down')}<div />
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginTop: 6, justifyContent: 'center' }}>
+        {btn('🔍+', 'ZoomTele')}
+        {btn('🔍−', 'ZoomWide')}
+      </div>
+      {error && <div style={{ fontSize: '.65rem', color: 'var(--red)', marginTop: 4 }}>⚠ {error}</div>}
+    </div>
+  )
+}
+
+// ── Edit Camera Modal ──────────────────────────────────────────────────────
+function EditCameraModal({ camId, initialName, onSave, onClose }) {
+  const [loading,   setLoading]  = useState(true)
+  const [saving,    setSaving]   = useState(false)
+  const [error,     setError]    = useState('')
+  const [details,   setDetails]  = useState(null)
+  const [name,      setName]     = useState(initialName)
+  const [ip,        setIp]       = useState('')
+  const [port,      setPort]     = useState('554')
+  const [username,  setUsername] = useState('')
+  const [password,  setPassword] = useState('')
+  const [channel,   setChannel]  = useState('1')
+  const [showPass,  setShowPass] = useState(false)
+
+  useEffect(() => {
+    getCamera(camId)
+      .then(d => {
+        setDetails(d)
+        setName(d.name)
+        setIp(d.ip || '')
+        setPort(String(d.port || 554))
+        setUsername(d.username || '')
+        setChannel(String(d.channel || 1))
+      })
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false))
+  }, [camId])
+
+  const submit = async () => {
+    const n = name.trim()
+    if (!n) { setError('Nama tidak boleh kosong'); return }
+    if (details && !details.builtin && !ip.trim()) { setError('IP tidak boleh kosong'); return }
+    setSaving(true)
+    try {
+      const body = { name: n }
+      if (details && !details.builtin) {
+        body.ip      = ip.trim()
+        body.port    = parseInt(port, 10) || 554
+        body.username = username.trim()
+        if (password) body.password = password
+        body.channel = parseInt(channel, 10) || 1
+      }
+      const updated = await updateCamera(camId, body)
+      onSave(updated.name)
+      onClose()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const isCustom = details && !details.builtin
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" onKeyDown={e => { if (e.key === 'Escape') onClose() }} style={{ maxWidth: 360 }}>
+        <div className="modal-title">✏️ Edit Kamera</div>
+
+        {loading ? (
+          <div style={{ color: 'var(--text-muted)', fontSize: '.82rem', padding: '12px 0', textAlign: 'center' }}>
+            Memuat data kamera...
+          </div>
+        ) : (
+          <>
+            <label>Nama Tampilan</label>
+            <input
+              autoFocus
+              value={name}
+              onChange={e => { setName(e.target.value); setError('') }}
+            />
+
+            {isCustom && (
+              <>
+                <div style={{ borderTop: '1px solid var(--border)', margin: '12px 0 10px', paddingTop: 10 }}>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '.05em' }}>
+                    Koneksi Kamera
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 90px', gap: 8, marginBottom: 10 }}>
+                  <div>
+                    <label style={{ fontSize: '.72rem' }}>IP Address</label>
+                    <input
+                      value={ip}
+                      onChange={e => { setIp(e.target.value); setError('') }}
+                      placeholder="10.10.80.2"
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '.72rem' }}>Port</label>
+                    <input
+                      type="number"
+                      value={port}
+                      onChange={e => setPort(e.target.value)}
+                      min="1" max="65535"
+                    />
+                  </div>
+                </div>
+
+                <label style={{ fontSize: '.72rem' }}>Username</label>
+                <input
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  placeholder="dashboard"
+                  style={{ marginBottom: 10 }}
+                />
+
+                <label style={{ fontSize: '.72rem' }}>Password</label>
+                <div style={{ position: 'relative', marginBottom: 10 }}>
+                  <input
+                    type={showPass ? 'text' : 'password'}
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    placeholder="Kosongkan untuk tidak mengubah"
+                    style={{ paddingRight: 36, width: '100%', boxSizing: 'border-box' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPass(p => !p)}
+                    style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: '.78rem', padding: 0 }}
+                    tabIndex={-1}
+                  >{showPass ? '🙈' : '👁️'}</button>
+                </div>
+
+                <label style={{ fontSize: '.72rem' }}>Channel</label>
+                <input
+                  type="number"
+                  value={channel}
+                  onChange={e => setChannel(e.target.value)}
+                  min="1" max="64"
+                />
+              </>
+            )}
+          </>
+        )}
+
+        {error && <div style={{ color: 'var(--red)', fontSize: '.78rem', marginTop: 6 }}>⚠ {error}</div>}
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose} disabled={saving}>Batal</button>
+          <button className="btn btn-primary" onClick={submit} disabled={loading || saving}>
+            {saving ? 'Menyimpan...' : 'Simpan'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export default function CCTVPlayer({ src, name, onRemove, removable, camId, onRename, dragHandleProps }) {
   const videoRef = useRef(null)
   const hlsRef   = useRef(null)
   const retryRef = useRef(null)
   const deadRef  = useRef(false)
   const recoverRef = useRef(0)
   const retryCountRef = useRef(0)
+  const lastFrameRef = useRef(null)   // data URL of last captured frame
+  const [hasPoster, setHasPoster] = useState(false)
   const [status, setStatus] = useState('loading')
   const [muted, setMuted]   = useState(true)
   const [errorMsg, setErrorMsg] = useState(null)
   const [retryKey, setRetryKey] = useState(0)
+  const [showPtz,  setShowPtz]  = useState(false)
+  const [showEdit, setShowEdit] = useState(false)
+  const [ptzCap,   setPtzCap]   = useState(null)  // null=unknown, true, false
+
+  useEffect(() => {
+    if (!camId) return
+    ptzCheck(camId).then(r => setPtzCap(r.supported)).catch(() => setPtzCap(false))
+  }, [camId])
 
   useEffect(() => {
     const video = videoRef.current
@@ -84,6 +302,7 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
 
     function cleanup() {
       clearTimeout(retryRef.current)
+      if (capInterval) { clearInterval(capInterval); capInterval = null }
       video.onloadeddata = null
       video.oncanplay = null
       video.oncanplaythrough = null
@@ -116,9 +335,23 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
         video.play().catch(() => {})
       }
 
+      let capInterval = null
+      const captureFrame = () => {
+        if (!video || video.readyState < 2 || video.videoWidth === 0) return
+        try {
+          const c = document.createElement('canvas')
+          c.width = video.videoWidth; c.height = video.videoHeight
+          c.getContext('2d').drawImage(video, 0, 0)
+          lastFrameRef.current = c.toDataURL('image/jpeg', 0.5)
+          setHasPoster(true)
+        } catch { /* tainted canvas — ignore */ }
+      }
+
       const markLive = () => {
         if (deadRef.current) return
         recoverRef.current = 0
+        captureFrame()
+        if (!capInterval) capInterval = setInterval(captureFrame, 8000)
         setStatus('live')
       }
 
@@ -163,8 +396,8 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
               return
             }
           } else if (data.response?.code === 404) {
-            // Stream not published yet (e.g. ch1 no camera).
-            // Slow retry — don't hammer mediamtx with rapid reconnects.
+            // Stream gap during ffmpeg restart (TLS session expiry ~90s on Dahua).
+            // Retry quickly so viewer sees brief black, not dead state.
             if (retryCountRef.current >= MAX_RETRIES) {
               attachDead('Stream tidak tersedia setelah beberapa percobaan (404)')
               return
@@ -172,7 +405,7 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
             retryCountRef.current += 1
             cleanup()
             setStatus('loading')
-            retryRef.current = setTimeout(attach, 8000)
+            retryRef.current = setTimeout(attach, 2000)   // 2s — stream back in ~1s
             return
           } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoverRef.current < 2) {
             // A transient playlist/segment miss should not tear down the player.
@@ -236,6 +469,9 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
   return (
     <div className="cam-card">
       <div className="cam-header">
+        {dragHandleProps && (
+          <span className="cam-drag-handle" {...dragHandleProps} title="Seret untuk pindahkan">⠿</span>
+        )}
         <div className="cam-title">
           <span className={`cam-status ${status}`} />
           {name}
@@ -244,18 +480,39 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
           <button className="btn-icon" onClick={() => setMuted(m => !m)} title={muted ? 'Unmute' : 'Mute'}>
             {muted ? '🔇' : '🔊'}
           </button>
+          {camId && (
+            <button
+              className="btn-icon"
+              onClick={() => ptzCap !== false && setShowPtz(v => !v)}
+              title={ptzCap === false ? 'PTZ tidak didukung' : ptzCap === null ? 'Memeriksa PTZ...' : 'PTZ Control'}
+              style={{
+                color: showPtz ? 'var(--accent)' : undefined,
+                opacity: ptzCap === false ? 0.35 : 1,
+                cursor: ptzCap === false ? 'not-allowed' : 'pointer',
+              }}
+            >🎮</button>
+          )}
           <button className="btn-icon" onClick={toggleFullscreen} title="Fullscreen">⛶</button>
+          <button className="btn-icon" onClick={() => setShowEdit(true)} title="Edit kamera">✏️</button>
           {removable && (
             <button className="btn-icon" onClick={onRemove} title="Hapus channel" style={{color:'var(--red)'}}>✕</button>
           )}
         </div>
       </div>
-      <div className="cam-video">
+      <div className={`cam-video ${status === 'loading' && hasPoster ? 'is-reconnecting' : ''}`}>
+        {/* Frozen last-frame poster shown while reconnecting */}
+        {hasPoster && lastFrameRef.current && (status === 'loading' || status === 'dead') && (
+          <img
+            src={lastFrameRef.current}
+            className="cam-last-frame"
+            alt=""
+            aria-hidden="true"
+          />
+        )}
         <video
           ref={(el) => {
             videoRef.current = el
             if (el && !hlsRef.current) {
-              // Only set muted on first mount (before any stream attaches)
               el.muted = true
               el.setAttribute('muted', '')
             }
@@ -266,6 +523,7 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
         {status === 'loading' && (
           <div className="cam-overlay"><span className="cam-spinner" /></div>
         )}
+        {showPtz && camId && <PTZPanel camId={camId} capable={ptzCap} />}
         {status === 'error' && (
           <div className="cam-error">
             <span className="cam-error-icon">📷</span>
@@ -273,7 +531,7 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
           </div>
         )}
         {status === 'dead' && (
-          <div className="cam-error">
+          <div className="cam-error" style={{ background: hasPoster ? 'rgba(0,0,0,0.55)' : undefined }}>
             <span className="cam-error-icon">⚠️</span>
             <span>{errorMsg || 'Stream tidak tersedia'}</span>
             <button
@@ -287,15 +545,22 @@ export default function CCTVPlayer({ src, name, onRemove, removable }) {
                 if (video) { video.muted = true; video.setAttribute('muted', '') }
                 setStatus('loading')
                 setMuted(true)
-                // Re-trigger the effect by forcing a re-attach via a local attach call
-                // We can't call attach() here (it's scoped inside useEffect),
-                // so we bump a separate state to force effect re-run.
                 setRetryKey(k => k + 1)
               }}
             >↺ Coba lagi</button>
           </div>
         )}
       </div>
+      {showEdit && (
+        <EditCameraModal
+          camId={camId}
+          initialName={name}
+          onSave={(newName) => {
+            if (onRename) onRename(camId, newName)
+          }}
+          onClose={() => setShowEdit(false)}
+        />
+      )}
     </div>
   )
 }

@@ -43,16 +43,7 @@ while :; do
     -map 0:v:0 \
     -dn \
     -an \
-    -c:v libx264 \
-    -preset ultrafast \
-    -tune zerolatency \
-    -pix_fmt yuv420p \
-    -g 25 \
-    -keyint_min 25 \
-    -sc_threshold 0 \
-    -b:v "$VIDEO_BITRATE" \
-    -maxrate "$MAXRATE_VALUE" \
-    -bufsize "$BUFSIZE_VALUE" \
+    -c:v copy \
     -rtsp_transport tcp \
     -f rtsp "rtsp://${MTX_HOST_VALUE}:${RTSP_PORT_VALUE}/${PATH_NAME}" &
   ffmpeg_pid=$!

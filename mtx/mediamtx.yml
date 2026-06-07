@@ -15,36 +15,28 @@ authInternalUsers:
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
 hlsSegmentMaxSize: 50MB
-hlsVariant: mpegts
+hlsVariant: fmp4
 # hlsAllowOrigins:
 #   - "*"
 hlsAlwaysRemux: yes
 
-# On-demand streaming: ffmpeg starts only when a viewer connects,
-# and stops after all viewers disconnect (saves CPU/bandwidth when idle).
+# Streams always running: ffmpeg starts on mediamtx startup and restarts on failure.
+# runOnDemand tidak dipakai karena MediaMTX v1.9 tidak trigger runOnDemand via HLS reader.
 paths:
   ch1:
-    runOnDemand: /app/start_stream.sh 1
-    runOnDemandRestart: yes
-    runOnDemandStartTimeout: 15s
-    runOnDemandCloseAfter: 30s
+    runOnInit: /app/start_stream.sh 1
+    runOnInitRestart: yes
 
   ch2:
-    runOnDemand: /app/start_stream.sh 2
-    runOnDemandRestart: yes
-    runOnDemandStartTimeout: 15s
-    runOnDemandCloseAfter: 30s
+    runOnInit: /app/start_stream.sh 2
+    runOnInitRestart: yes
 
   ch3:
-    runOnDemand: /app/start_stream.sh 3
-    runOnDemandRestart: yes
-    runOnDemandStartTimeout: 15s
-    runOnDemandCloseAfter: 30s
+    runOnInit: /app/start_stream.sh 3
+    runOnInitRestart: yes
 
   ch4:
-    runOnDemand: /app/start_stream.sh 4
-    runOnDemandRestart: yes
-    runOnDemandStartTimeout: 15s
-    runOnDemandCloseAfter: 30s
+    runOnInit: /app/start_stream.sh 4
+    runOnInitRestart: yes
 
   '~^custom_[0-9a-f]+$': {}

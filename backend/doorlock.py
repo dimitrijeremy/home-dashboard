@@ -16,21 +16,13 @@ from datetime import datetime
 
 import requests
 
-# Try to import tuya-connector; gracefully degrade if not installed
+# Try to import tinytuya; gracefully degrade if not installed
 try:
-    from tuya_connector import TuyaOpenAPI, TUYA_LOGGER
+    import tinytuya
     TUYA_AVAILABLE = True
 except ImportError:
     TUYA_AVAILABLE = False
 
-
-# Tuya API region endpoints
-TUYA_ENDPOINTS = {
-    'us': 'https://openapi.tuyaus.com',
-    'eu': 'https://openapi.tuyaeu.com',
-    'cn': 'https://openapi.tuyacn.com',
-    'in': 'https://openapi.tuyain.com',
-}
 
 # Default DPs (Data Points) for Paloma DLP6202
 # These may vary - users can override via config
@@ -80,7 +72,7 @@ class TuyaDoorLock:
         self._last_error = None
 
         if not TUYA_AVAILABLE:
-            self._last_error = "tuya-connector-python not installed"
+            self._last_error = "tinytuya not installed"
             return False
 
         access_id = config.get('access_id', '').strip()
@@ -91,17 +83,18 @@ class TuyaDoorLock:
             self._last_error = "Access ID and Secret are required"
             return False
 
-        endpoint = TUYA_ENDPOINTS.get(region, TUYA_ENDPOINTS['us'])
-
         try:
-            self._api = TuyaOpenAPI(endpoint, access_id, access_secret)
-            resp = self._api.connect()
-            if resp.get('success'):
+            self._api = tinytuya.Cloud(
+                apiRegion=region,
+                apiKey=access_id,
+                apiSecret=access_secret,
+            )
+            if self._api.token_info and self._api.token_info.get('access_token'):
                 self._connected = True
                 self._last_error = None
                 return True
             else:
-                self._last_error = resp.get('msg', 'Connection failed')
+                self._last_error = getattr(self._api, 'error', None) or 'Failed to obtain access token'
                 return False
         except Exception as e:
             self._last_error = str(e)[:200]
@@ -118,7 +111,7 @@ class TuyaDoorLock:
         if not device_id:
             raise ValueError("device_id not configured")
 
-        resp = self._api.get(f'/v1.0/devices/{device_id}/status')
+        resp = self._api.cloudrequest(f'/v1.0/devices/{device_id}/status')
         if resp.get('success'):
             status_list = resp.get('result', [])
             status_map = {}
@@ -137,9 +130,9 @@ class TuyaDoorLock:
             raise ValueError("device_id not configured")
 
         # Tuya smart lock remote unlock via password-free temporary key
-        resp = self._api.post(
+        resp = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/door-lock/password-free/open-door',
-            body={}
+            post={}
         )
 
         if resp.get('success'):
@@ -147,9 +140,9 @@ class TuyaDoorLock:
             return True
 
         # Fallback: try direct command
-        resp2 = self._api.post(
+        resp2 = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/commands',
-            body={'commands': [{'code': 'unlock_fingerprint', 'value': True}]}
+            post={'commands': [{'code': 'unlock_fingerprint', 'value': True}]}
         )
         if resp2.get('success'):
             self._add_event('unlock', 'Remote unlock via command')
@@ -164,9 +157,9 @@ class TuyaDoorLock:
         if not device_id:
             raise ValueError("device_id not configured")
 
-        resp = self._api.post(
+        resp = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/commands',
-            body={'commands': [{'code': 'reverse_lock', 'value': True}]}
+            post={'commands': [{'code': 'reverse_lock', 'value': True}]}
         )
         if resp.get('success'):
             self._add_event('lock', 'Remote lock via dashboard')
@@ -184,9 +177,9 @@ class TuyaDoorLock:
             raise ValueError("device_id not configured")
 
         # Try IPC stream allocation
-        resp = self._api.post(
+        resp = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/stream/actions/allocate',
-            body={'type': 'hls'}
+            post={'type': 'hls'}
         )
 
         if resp.get('success'):
@@ -198,9 +191,9 @@ class TuyaDoorLock:
             }
 
         # Fallback: try RTMP
-        resp2 = self._api.post(
+        resp2 = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/stream/actions/allocate',
-            body={'type': 'rtmp'}
+            post={'type': 'rtmp'}
         )
         if resp2.get('success'):
             result = resp2.get('result', {})
@@ -219,9 +212,9 @@ class TuyaDoorLock:
         if not device_id:
             return
 
-        self._api.post(
+        self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/stream/actions/deallocate',
-            body={}
+            post={}
         )
 
     def start_talk(self):
@@ -235,17 +228,17 @@ class TuyaDoorLock:
             raise ValueError("device_id not configured")
 
         # Request audio talk session
-        resp = self._api.post(
+        resp = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/stream/actions/allocate',
-            body={'type': 'talk'}
+            post={'type': 'talk'}
         )
         if resp.get('success'):
             return resp.get('result', {})
 
         # Some devices use different endpoint
-        resp2 = self._api.post(
+        resp2 = self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/door-lock/actions/talk',
-            body={'action': 'start'}
+            post={'action': 'start'}
         )
         if resp2.get('success'):
             return resp2.get('result', {})
@@ -258,9 +251,9 @@ class TuyaDoorLock:
         device_id = self._config.get('device_id', '').strip()
         if not device_id:
             return
-        self._api.post(
+        self._api.cloudrequest(
             f'/v1.0/devices/{device_id}/door-lock/actions/talk',
-            body={'action': 'stop'}
+            post={'action': 'stop'}
         )
 
     def get_alerts(self, start_time=None, end_time=None, limit=20):
@@ -274,15 +267,12 @@ class TuyaDoorLock:
             raise ValueError("device_id not configured")
 
         # Get device logs for alerts
-        resp = self._api.get(
-            f'/v1.0/devices/{device_id}/logs',
-            params={
-                'type': '1,2,3,4,5,6,7',
-                'size': str(limit),
-                'start_time': str(start_time or ''),
-                'end_time': str(end_time or ''),
-            }
-        )
+        params = f'?type=1,2,3,4,5,6,7&size={limit}'
+        if start_time:
+            params += f'&start_time={start_time}'
+        if end_time:
+            params += f'&end_time={end_time}'
+        resp = self._api.cloudrequest(f'/v1.0/devices/{device_id}/logs{params}')
 
         if resp.get('success'):
             logs = resp.get('result', {}).get('logs', [])
