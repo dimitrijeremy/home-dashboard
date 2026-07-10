@@ -17,6 +17,8 @@ export default function ConfigPage({ onBack }) {
   const [selectedCam, setSelectedCam] = useState(null)
 
   // NVR config state
+  const [nvrHost, setNvrHost]     = useState('')
+  const [nvrPort, setNvrPort]     = useState('80')
   const [streamUser, setStreamUser] = useState('')
   const [streamPass, setStreamPass] = useState('')
   const [nvrUser, setNvrUser]     = useState('')
@@ -53,6 +55,8 @@ export default function ConfigPage({ onBack }) {
       setNvrInfoLoading(true)
       fetchNvrConfig()
         .then(cfg => {
+          setNvrHost(cfg.host || '')
+          setNvrPort(String(cfg.http_port || 80))
           setStreamUser(cfg.stream_user || '')
           setStreamPass(cfg.stream_pass || '')
           setNvrUser(cfg.event_user || '')
@@ -73,12 +77,14 @@ export default function ConfigPage({ onBack }) {
     setNvrMsg(null)
     try {
       await postNvrConfig({
+        host: nvrHost,
+        http_port: Number(nvrPort) || 80,
         stream_user: streamUser,
         stream_pass: streamPass,
         event_user: nvrUser,
         event_pass: nvrPass,
       })
-      setNvrMsg({ ok: true, text: 'Tersimpan. Channel 1-4 akan memakai kredensial baru saat stream direstart; event worker saat reconnect.' })
+      setNvrMsg({ ok: true, text: 'Tersimpan. Channel built-in akan memakai host/kredensial baru saat stream direstart; event worker saat reconnect.' })
     } catch (err) {
       setNvrMsg({ ok: false, text: err.message || 'Gagal menyimpan' })
     } finally {
@@ -224,14 +230,37 @@ export default function ConfigPage({ onBack }) {
             </div>
 
             <form className="nvr-cred-form" onSubmit={handleNvrSave}>
-              <div className="nvr-cred-group-title">Stream CCTV Channel 1-4</div>
+              <div className="nvr-cred-group-title">Alamat NVR</div>
+              <div className="nvr-cred-field">
+                <label>Host / IP NVR</label>
+                <input
+                  type="text"
+                  value={nvrHost}
+                  onChange={e => setNvrHost(e.target.value)}
+                  placeholder="mis. 10.10.30.2"
+                  required
+                />
+              </div>
+              <div className="nvr-cred-field">
+                <label>Port HTTP</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={nvrPort}
+                  onChange={e => setNvrPort(e.target.value)}
+                  placeholder="80"
+                  required
+                />
+              </div>
+
+              <div className="nvr-cred-group-title">Stream CCTV Channel Built-in</div>
               <div className="nvr-cred-field">
                 <label>Username Stream</label>
                 <input
                   type="text"
                   value={streamUser}
                   onChange={e => setStreamUser(e.target.value)}
-                  placeholder="dashboard2"
+                  placeholder="username NVR"
                   autoComplete="username"
                   required
                 />
@@ -256,7 +285,7 @@ export default function ConfigPage({ onBack }) {
                   type="text"
                   value={nvrUser}
                   onChange={e => setNvrUser(e.target.value)}
-                  placeholder="dashboard2"
+                  placeholder="username NVR"
                   autoComplete="username"
                   required
                 />

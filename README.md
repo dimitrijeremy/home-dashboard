@@ -93,7 +93,20 @@ docker compose restart mtx
 
 ## Konfigurasi Environment
 
-### Backend (`docker-compose.yml` → service `backend`)
+Kredensial & host NVR **tidak lagi ditulis di `docker-compose.yml`**. Salin
+`.env.example` menjadi `.env` lalu isi nilainya:
+
+```bash
+cp .env.example .env
+# edit .env → isi DVR_HOST, DVR_USER, DVR_PASS
+```
+
+Nilai di `.env` hanya dipakai sebagai **seed awal** saat database masih kosong.
+Setelah aplikasi berjalan, host/port/kredensial NVR dikelola dari menu
+**Konfigurasi → Kredensial NVR** di dashboard dan tersimpan di database
+(tabel `settings`).
+
+### Backend
 
 | Variable | Default | Keterangan |
 |----------|---------|------------|
@@ -102,12 +115,13 @@ docker compose restart mtx
 | `DB_PATH` | `/data/cameras.db` | Path SQLite database (di dalam volume) |
 | `FACE_PHOTO_DIR` | `/data/face_photos` | Direktori foto wajah terdaftar |
 | `SNAPSHOT_DIR` | `/data/snapshots` | Direktori snapshot kamera dari analyzer |
-| `DVR_HOST` | `10.10.30.2` | IP Dahua NVR |
-| `DVR_HTTP_PORT` | `80` | Port HTTP NVR |
-| `DVR_USER` | `dashboard` | User untuk RTSP (dibaca stream) |
-| `DVR_PASS` | `d4$$hb0ard-dlt` | Password DVR_USER (di compose gunakan `$$` untuk karakter `$`) |
+| `DVR_HOST` | kosong | IP Dahua NVR (seed awal; selanjutnya dari menu konfigurasi) |
+| `DVR_HTTP_PORT` | `80` | Port HTTP NVR (seed awal) |
+| `DVR_USER` | kosong | User untuk RTSP stream (seed awal) |
+| `DVR_PASS` | kosong | Password DVR_USER (seed awal) |
 | `DVR_EVENT_USER` | _(sama dengan DVR_USER)_ | User untuk NVR event stream. Butuh hak **Remote Alarm/Event**. Kosongkan untuk fallback ke DVR_USER. |
 | `DVR_EVENT_PASS` | _(sama dengan DVR_PASS)_ | Password DVR_EVENT_USER |
+| `NVR_CHANNELS` | `4` | Jumlah channel built-in NVR (seed awal setting `builtin_channel_count`) |
 
 ### Analyzer (`docker-compose.yml` → service `analyzer`)
 
@@ -120,6 +134,11 @@ docker compose restart mtx
 | `FACE_THRESH` | `0.40` | Threshold similarity untuk pengenalan wajah (0–1) |
 | `ZONE_CONF` | `0.40` | Confidence minimum YOLO untuk deteksi orang |
 | `COOLDOWN_SECS` | `20` | Jeda minimum antar event per orang per zona (detik) |
+| `FACE_EVERY_SECS` | `2.0` | Face recognition maksimal 1× per N detik per channel (hemat CPU) |
+| `YOLO_IMGSZ` | `640` | Ukuran inferensi YOLO — 480/416 jauh lebih hemat CPU |
+
+Deteksi AI juga bisa dimatikan **per kamera** dari tombol ✎ (edit) pada tiap
+kamera di dashboard — analyzer hanya memproses kamera dengan AI aktif.
 
 ---
 
@@ -130,8 +149,8 @@ Backend membuka koneksi persistent ke `GET /cgi-bin/eventManager.cgi?action=atta
 **Syarat:** User yang digunakan (`DVR_EVENT_USER`) harus punya hak **Remote Alarm** di NVR.
 
 Cara aktifkan di web NVR:
-1. Buka `http://10.10.30.2` → login sebagai admin
-2. **Configuration → Account** → Edit user `dashboard` (atau buat user baru)
+1. Buka `http://<ip-nvr>` → login sebagai admin
+2. **Configuration → Account** → Edit user yang dipakai dashboard (atau buat user baru)
 3. Centang **Remote Alarm** (di bawah Permission/Privilege)
 4. Simpan → backend akan connect otomatis di retry berikutnya
 

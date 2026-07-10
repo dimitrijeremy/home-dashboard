@@ -4,15 +4,21 @@ services:
   # Di Mac lokal: TIDAK dijalankan di sini, jalankan binary mediamtx di host:
   #   ./mediamtx mediamtx.yml
   # Di server Linux: jalankan bersama lewat docker compose up
+  #
+  # Kredensial & host NVR TIDAK ditulis di file ini — isi lewat file .env
+  # (lihat .env.example). Nilai env hanya seed awal; setelah itu dikelola dari
+  # menu konfigurasi dashboard (tersimpan di database).
   mtx:
     build: ./mtx
     volumes:
       - ./mtx/mediamtx.yml:/app/mediamtx.yml:ro
       - ./mtx/start_stream.sh:/app/start_stream.sh:ro
     environment:
-      - DVR_HOST=10.10.30.2
-      - DVR_USER=dashboard
-      - DVR_PASS=d4$$hb0ard-dlt
+      # Fallback bila backend belum siap; nilai utama diambil dari
+      # /api/nvr-config backend (database).
+      - DVR_HOST=${DVR_HOST:-}
+      - DVR_USER=${DVR_USER:-}
+      - DVR_PASS=${DVR_PASS:-}
     networks:
       - hd-net
     restart: unless-stopped
@@ -27,18 +33,22 @@ services:
       - BASE_URL=
       # INTERNAL_HLS_URL: digunakan backend untuk cek stream status (container-to-container)
       - INTERNAL_HLS_URL=http://mtx:8888
+      - MTX_API_URL=http://mtx:9997
       - DB_PATH=/data/cameras.db
       - FACE_PHOTO_DIR=/data/face_photos
       - SNAPSHOT_DIR=/data/snapshots
-      - DVR_HOST=10.10.30.2
-      - DVR_HTTP_PORT=80
-      - DVR_USER=dashboard2
-      - DVR_PASS=d4$$hb0ard-dlt
+      # Seed awal konfigurasi NVR — hanya dipakai saat database masih kosong.
+      # Setelah itu, ubah dari menu Konfigurasi > Kredensial NVR di dashboard.
+      - DVR_HOST=${DVR_HOST:-}
+      - DVR_HTTP_PORT=${DVR_HTTP_PORT:-80}
+      - DVR_USER=${DVR_USER:-}
+      - DVR_PASS=${DVR_PASS:-}
       # Event stream NVR butuh akun dengan hak operator/admin Dahua.
-      # Set DVR_EVENT_USER + DVR_EVENT_PASS untuk akun dengan hak lebih tinggi.
       # Jika kosong, fallback ke DVR_USER/DVR_PASS.
-      - DVR_EVENT_USER=
-      - DVR_EVENT_PASS=
+      - DVR_EVENT_USER=${DVR_EVENT_USER:-}
+      - DVR_EVENT_PASS=${DVR_EVENT_PASS:-}
+      # Jumlah channel built-in NVR (seed awal setting builtin_channel_count)
+      - NVR_CHANNELS=${NVR_CHANNELS:-4}
       # MTX_HOST + RTSP_PORT: digunakan start_custom_stream.sh di backend untuk
       # push stream custom ke mediamtx container via jaringan internal Docker.
       - MTX_HOST=mtx
@@ -47,6 +57,7 @@ services:
       - camera_data:/data
     networks:
       - hd-net
+    restart: unless-stopped
 
   analyzer:
     build: ./analyzer
@@ -54,16 +65,21 @@ services:
       - BACKEND_URL=http://backend:5000
       - MTX_RTSP=rtsp://mtx:8554
       - SNAPSHOT_DIR=/data/snapshots
-      - PROCESS_EVERY=8
-      - FACE_THRESH=0.40
-      - ZONE_CONF=0.40
-      - COOLDOWN_SECS=20
+      - PROCESS_EVERY=${PROCESS_EVERY:-8}
+      - FACE_THRESH=${FACE_THRESH:-0.40}
+      - ZONE_CONF=${ZONE_CONF:-0.40}
+      - COOLDOWN_SECS=${COOLDOWN_SECS:-20}
+      # Face recognition maksimal 1x per N detik per channel (hemat CPU)
+      - FACE_EVERY_SECS=${FACE_EVERY_SECS:-2.0}
+      # Ukuran inferensi YOLO — turunkan ke 480/416 untuk hemat CPU signifikan
+      - YOLO_IMGSZ=${YOLO_IMGSZ:-640}
     volumes:
       - camera_data:/data
     depends_on:
       - backend
     networks:
       - hd-net
+    restart: unless-stopped
     # Analyzer opsional — tidak ikut 'docker compose up' biasa
     profiles:
       - ai
@@ -79,6 +95,7 @@ services:
       - backend
     networks:
       - hd-net
+    restart: unless-stopped
 
 networks:
   hd-net:
@@ -86,4 +103,3 @@ networks:
 
 volumes:
   camera_data:
-

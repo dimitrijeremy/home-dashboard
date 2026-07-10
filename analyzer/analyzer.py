@@ -42,6 +42,11 @@ FACE_THRESH   = float(os.getenv("FACE_THRESH", "0.40"))
 ZONE_CONF     = float(os.getenv("ZONE_CONF",   "0.40"))
 COOLDOWN_SECS = int(os.getenv("COOLDOWN_SECS", "20"))
 REFRESH_SECS  = int(os.getenv("REFRESH_SECS",  "30"))
+# Face recognition jauh lebih mahal dari YOLO — jalankan maksimal sekali per
+# FACE_EVERY_SECS per channel, bukan pada setiap orang di setiap frame.
+FACE_EVERY_SECS = float(os.getenv("FACE_EVERY_SECS", "2.0"))
+# Ukuran inferensi YOLO; turunkan (mis. 480/416) untuk hemat CPU signifikan.
+YOLO_IMGSZ    = int(os.getenv("YOLO_IMGSZ", "640"))
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
@@ -70,6 +75,19 @@ zone_db_lock  = threading.Lock()
 # {(channel_id, key): last_triggered_ts}
 cooldowns: dict = {}
 cooldown_lock   = threading.Lock()
+
+# {channel_id: last_face_recognition_ts} — throttle face recognition
+_face_last_run: dict = {}
+_face_last_lock = threading.Lock()
+
+
+def _face_due(channel_id: str) -> bool:
+    now = time.time()
+    with _face_last_lock:
+        if now - _face_last_run.get(channel_id, 0) >= FACE_EVERY_SECS:
+            _face_last_run[channel_id] = now
+            return True
+    return False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -250,12 +268,14 @@ def periodic_refresh():
 def process_frame(camera_id: int, camera_name: str, channel_id: str,
                   frame: np.ndarray):
     h, w = frame.shape[:2]
-    results = yolo(frame, classes=[0], conf=ZONE_CONF, verbose=False)
+    results = yolo(frame, classes=[0], conf=ZONE_CONF, imgsz=YOLO_IMGSZ, verbose=False)
     if not results or len(results[0].boxes) == 0:
         return
 
     with zone_db_lock:
         cam_zones = list(zone_db.get(camera_id, []))
+
+    run_face = _face_due(channel_id)
 
     for box in results[0].boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
@@ -274,7 +294,10 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
             "detection_box": bbox_norm,
             "frame_size": {"width": w, "height": h},
         }
-        face_found, person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
+        if run_face:
+            face_found, person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
+        else:
+            face_found, person_name, face_conf = False, None, 0.0
         if face_found:
             event_extra["face_detected"] = True
 
@@ -312,24 +335,27 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
 
 
 # ── Channel Worker ─────────────────────────────────────────────────────────────
-def channel_worker(camera_id: int, camera_name: str, channel_id: str):
+def channel_worker(camera_id: int, camera_name: str, channel_id: str,
+                   stop_event: threading.Event):
     rtsp_url = f"{MTX_RTSP_BASE}/{channel_id}"
     log.info(f"Worker start: {channel_id} → {rtsp_url}")
     frame_count = 0
 
-    while True:
+    while not stop_event.is_set():
         cap = cv2.VideoCapture(rtsp_url)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
         if not cap.isOpened():
+            cap.release()
             log.warning(f"{channel_id}: RTSP open failed, retry in 10s")
-            time.sleep(10)
+            if stop_event.wait(10):
+                break
             continue
 
         log.info(f"{channel_id}: stream opened OK")
         try:
             snap_path = os.path.join(SNAPSHOT_DIR, f"{channel_id}.jpg")
-            while True:
+            while not stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     log.warning(f"{channel_id}: read failed, reconnecting…")
@@ -347,15 +373,18 @@ def channel_worker(camera_id: int, camera_name: str, channel_id: str):
         finally:
             cap.release()
 
-        time.sleep(5)
+        stop_event.wait(5)
+
+    log.info(f"Worker stop: {channel_id}")
 
 
 # ── Camera Discovery + Thread Management ──────────────────────────────────────
-_workers: dict[str, threading.Thread] = {}
+# {channel_id: {"thread": Thread, "stop": Event}}
+_workers: dict[str, dict] = {}
 
 
 def sync_workers():
-    """Start/stop worker threads to match cameras from backend."""
+    """Start/stop worker threads to match AI-enabled cameras from backend."""
     try:
         r = requests.get(f"{BACKEND_URL}/api/cameras", timeout=8)
         if r.status_code != 200:
@@ -367,27 +396,33 @@ def sync_workers():
 
     active_channels = set()
     for cam in cameras:
+        # Hormati toggle AI per kamera dari dashboard (kolom ai_enabled di DB)
+        if not cam.get("ai_enabled", 1):
+            continue
         from urllib.parse import urlsplit
         path_seg = urlsplit(cam["stream_url"]).path.strip("/").split("/")[0]
         if not path_seg:
             continue
         active_channels.add(path_seg)
-        if path_seg not in _workers or not _workers[path_seg].is_alive():
+        entry = _workers.get(path_seg)
+        if not entry or not entry["thread"].is_alive():
+            stop_event = threading.Event()
             t = threading.Thread(
                 target=channel_worker,
-                args=(cam["id"], cam["name"], path_seg),
+                args=(cam["id"], cam["name"], path_seg, stop_event),
                 daemon=True,
                 name=f"worker-{path_seg}",
             )
-            _workers[path_seg] = t
+            _workers[path_seg] = {"thread": t, "stop": stop_event}
             t.start()
             log.info(f"Started worker thread for {path_seg}")
 
-    # Threads for removed cameras will exit gracefully (stream will close)
+    # Beri sinyal stop untuk kamera yang dihapus / AI-nya dimatikan
     for ch in list(_workers.keys()):
         if ch not in active_channels:
+            _workers[ch]["stop"].set()
             del _workers[ch]
-            log.info(f"Removed worker reference for {ch}")
+            log.info(f"Stopping worker for {ch}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

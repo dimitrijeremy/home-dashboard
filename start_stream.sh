@@ -1,35 +1,53 @@
 #!/bin/sh
-# start_stream.sh — dipanggil oleh mediamtx runOnInit per channel
-# Usage: start_stream.sh <channel_number>
-# Credentials disimpan di sini sehingga mediamtx YAML tidak perlu mengandung $
-# (mediamtx mengexpand $VAR sebelum passing ke shell, sehingga d4$hb0ard hilang)
+# start_stream.sh — dipanggil mediamtx runOnDemand per channel (versi host Mac)
+# Usage: start_stream.sh <chN | N>   (mediamtx memanggil dengan $MTX_PATH, mis. "ch2")
+# Host + credentials NVR diambil dari /api/nvr-config backend (menu konfigurasi
+# dashboard); fallback ke env var. Tidak ada kredensial hardcode di file ini.
+#
+# CATATAN: sengaja TIDAK melakukan deteksi codec via ffprobe sebelum ffmpeg —
+# itu berarti koneksi RTSPS kedua ke NVR (auth attempt ganda, berisiko lockout
+# akun Dahua) dan tanpa timeout bisa menggantung sampai runOnDemandStartTimeout
+# habis sehingga stream gagal tampil. Selalu transcode ke H.264.
 
-CH=$1
-DVR_HOST=${DVR_HOST:-10.10.30.2}
-DVR_USER=${DVR_USER:-dashboard}
-DVR_PASS=${DVR_PASS:-'d4$hb0ard-dlt'}   # fallback only; config menu is preferred
-NVR_CONFIG_URL=${NVR_CONFIG_URL:-http://localhost:5001/api/nvr-config}
+RAW=$1
+CH=$(printf '%s' "$RAW" | sed 's/^ch//')
 
-# Channel 1-4 credentials come from the dashboard config menu.
-# If backend is still booting, fall back to env/defaults so MediaMTX can retry.
-CONFIG_JSON=$(curl -fsS --max-time 3 "$NVR_CONFIG_URL" 2>/dev/null || true)
-if [ -n "$CONFIG_JSON" ]; then
-  CONFIG_CREDS=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json, sys; d=json.load(sys.stdin); print(d.get("stream_user") or ""); print(d.get("stream_pass") or "")' 2>/dev/null || true)
-  CONFIG_USER=$(printf '%s\n' "$CONFIG_CREDS" | sed -n '1p')
-  CONFIG_PASS=$(printf '%s\n' "$CONFIG_CREDS" | sed -n '2p')
-  if [ -n "$CONFIG_USER" ]; then DVR_USER=$CONFIG_USER; fi
-  if [ -n "$CONFIG_PASS" ]; then DVR_PASS=$CONFIG_PASS; fi
+if [ -z "$CH" ]; then
+  echo "usage: start_stream.sh <chN | N>" >&2
+  exit 1
 fi
 
-SOURCE_URL="rtsps://${DVR_USER}:${DVR_PASS}@${DVR_HOST}:554/cam/realmonitor?channel=${CH}&subtype=0&unicast=true&proto=Onvif&tls=true"
+FFMPEG_BIN=${FFMPEG_BIN:-/opt/homebrew/bin/ffmpeg}
+DVR_HOST_VAL=${DVR_HOST:-}
+DVR_USER_VAL=${DVR_USER:-}
+DVR_PASS_VAL=${DVR_PASS:-}
+STREAM_SUBTYPE=${DVR_STREAM_SUBTYPE:-0}
+START_DELAY=${STREAM_START_DELAY:-5}
+NVR_CONFIG_URL=${NVR_CONFIG_URL:-http://localhost:5001/api/nvr-config}
 
-# ── Pacing delay ─────────────────────────────────────────────────────────────
-# mediamtx runOnInitRestart: yes akan restart script ini langsung saat keluar.
-# Tambahkan jeda 15s agar auth attempt ke NVR tidak berulang terlalu cepat.
-# Tanpa ini, ffmpeg restart bisa > 60x/menit dan trigger Dahua account lock.
-sleep 15
+# Pacing delay: cegah auth attempt terlalu cepat ke NVR saat restart loop
+# (Dahua bisa mengunci akun).
+sleep "$START_DELAY"
 
-exec /opt/homebrew/bin/ffmpeg \
+CONFIG_JSON=$(curl -fsS --max-time 3 "$NVR_CONFIG_URL" 2>/dev/null || true)
+if [ -n "$CONFIG_JSON" ]; then
+  H=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("host") or "")' 2>/dev/null || true)
+  U=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stream_user") or "")' 2>/dev/null || true)
+  P=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stream_pass") or "")' 2>/dev/null || true)
+  if [ -n "$H" ]; then DVR_HOST_VAL=$H; fi
+  if [ -n "$U" ]; then DVR_USER_VAL=$U; fi
+  if [ -n "$P" ]; then DVR_PASS_VAL=$P; fi
+fi
+
+if [ -z "$DVR_HOST_VAL" ]; then
+  echo "[stream] NVR host belum dikonfigurasi (menu konfigurasi dashboard / env DVR_HOST)" >&2
+  sleep 20
+  exit 1
+fi
+
+SOURCE_URL="rtsps://${DVR_USER_VAL}:${DVR_PASS_VAL}@${DVR_HOST_VAL}:554/cam/realmonitor?channel=${CH}&subtype=${STREAM_SUBTYPE}&unicast=true&proto=Onvif&tls=true"
+
+exec "$FFMPEG_BIN" \
   -hide_banner -loglevel warning \
   -rtsp_transport tcp -tls_verify 0 \
   -i "$SOURCE_URL" \

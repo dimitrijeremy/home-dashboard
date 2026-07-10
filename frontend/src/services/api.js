@@ -10,15 +10,41 @@ export async function fetchCameras() {
   return res.json()
 }
 
-export async function addCamera(name, rtsp_url, channel) {
+export async function addCamera(name, rtsp_url, channel, ptz_supported = false) {
   const res = await fetch(url('/api/cameras'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, rtsp_url, channel }),
+    body: JSON.stringify({ name, rtsp_url, channel, ptz_supported }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.error || 'Failed to add camera')
+  }
+  return res.json()
+}
+
+export async function updateCamera(id, body) {
+  const res = await fetch(url(`/api/cameras/${id}`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to update camera')
+  }
+  return res.json()
+}
+
+export async function ptzCommand(id, action, code, speed = 4) {
+  const res = await fetch(url(`/api/cameras/${id}/ptz`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, code, speed }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'PTZ command failed')
   }
   return res.json()
 }

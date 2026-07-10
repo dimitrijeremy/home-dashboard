@@ -1,7 +1,83 @@
 import React, { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
+import { ptzCommand } from '../../services/api'
 
 const DEFAULT_VIDEO_SIZE = { width: 1920, height: 1080 }
+
+// ── PTZ pad ────────────────────────────────────────────────────────────────
+// Tekan-tahan mengirim ptz start, lepas mengirim stop (Dahua ptz.cgi via backend).
+function PTZPad({ camId }) {
+  const activeRef = useRef(null)
+  const [err, setErr] = useState(null)
+  const errTimer = useRef(null)
+
+  const showErr = (msg) => {
+    setErr(msg)
+    clearTimeout(errTimer.current)
+    errTimer.current = setTimeout(() => setErr(null), 3000)
+  }
+
+  const start = (code) => {
+    activeRef.current = code
+    ptzCommand(camId, 'start', code).catch(e => showErr(e.message))
+  }
+  const stop = () => {
+    const code = activeRef.current
+    if (!code) return
+    activeRef.current = null
+    ptzCommand(camId, 'stop', code).catch(() => {})
+  }
+
+  useEffect(() => () => { stop(); clearTimeout(errTimer.current) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const btnStyle = {
+    width: 30, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    background: 'rgba(0,0,0,.55)', color: '#fff', border: '1px solid rgba(255,255,255,.25)',
+    borderRadius: 6, cursor: 'pointer', fontSize: 13, userSelect: 'none', touchAction: 'none',
+  }
+  const btn = (code, label, title) => (
+    <button
+      type="button"
+      title={title}
+      style={btnStyle}
+      onPointerDown={(e) => { e.preventDefault(); start(code) }}
+      onPointerUp={stop}
+      onPointerLeave={stop}
+      onPointerCancel={stop}
+      onContextMenu={(e) => e.preventDefault()}
+    >{label}</button>
+  )
+
+  return (
+    <div style={{
+      position: 'absolute', right: 10, bottom: 10, zIndex: 5,
+      display: 'flex', gap: 6, alignItems: 'flex-end',
+    }}>
+      {err && (
+        <div style={{
+          background: 'rgba(239,68,68,.9)', color: '#fff', fontSize: '.68rem',
+          padding: '4px 8px', borderRadius: 6, maxWidth: 180, alignSelf: 'center',
+        }}>{err}</div>
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 30px)', gap: 4 }}>
+        <span />{btn('Up', '▲', 'Atas')}<span />
+        {btn('Left', '◀', 'Kiri')}<span />{btn('Right', '▶', 'Kanan')}
+        <span />{btn('Down', '▼', 'Bawah')}<span />
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {btn('ZoomTele', '＋', 'Zoom in')}
+        {btn('ZoomWide', '－', 'Zoom out')}
+      </div>
+      <div style={{
+        position: 'absolute', right: 0, top: -20, whiteSpace: 'nowrap',
+        fontSize: '.6rem', color: 'rgba(255,255,255,.75)',
+        textShadow: '0 1px 2px rgba(0,0,0,.8)',
+      }}>
+        ⏱ video tertunda ±5–10 dtk dari gerakan asli
+      </div>
+    </div>
+  )
+}
 
 function normalizeStreamUrl(src) {
   return src
@@ -81,7 +157,7 @@ const HLS_CONFIG = {
 
 const MAX_RETRIES = 5
 
-export default function CCTVPlayer({ src, name, zones = [], showZones = false, onRemove, removable }) {
+export default function CCTVPlayer({ camId, src, name, zones = [], showZones = false, onRemove, removable, onEdit, ptzSupported = false }) {
   const videoRef = useRef(null)
   const hlsRef   = useRef(null)
   const retryRef = useRef(null)
@@ -93,6 +169,7 @@ export default function CCTVPlayer({ src, name, zones = [], showZones = false, o
   const [errorMsg, setErrorMsg] = useState(null)
   const [retryKey, setRetryKey] = useState(0)
   const [videoSize, setVideoSize] = useState(DEFAULT_VIDEO_SIZE)
+  const [showPtz, setShowPtz] = useState(false)
 
   useEffect(() => {
     const video = videoRef.current
@@ -281,6 +358,17 @@ export default function CCTVPlayer({ src, name, zones = [], showZones = false, o
           {name}
         </div>
         <div className="cam-actions">
+          {camId != null && ptzSupported && (
+            <button
+              className="btn-icon"
+              onClick={() => setShowPtz(p => !p)}
+              title={showPtz ? 'Sembunyikan kontrol PTZ' : 'Kontrol PTZ'}
+              style={showPtz ? { color: 'var(--accent)' } : undefined}
+            >🕹</button>
+          )}
+          {onEdit && (
+            <button className="btn-icon" onClick={onEdit} title="Edit channel">✎</button>
+          )}
           <button className="btn-icon" onClick={() => setMuted(m => !m)} title={muted ? 'Unmute' : 'Mute'}>
             {muted ? '🔇' : '🔊'}
           </button>
@@ -303,6 +391,7 @@ export default function CCTVPlayer({ src, name, zones = [], showZones = false, o
           autoPlay
           playsInline
         />
+        {showPtz && camId != null && ptzSupported && <PTZPad camId={camId} />}
         {overlayZones.length > 0 && (
           <div className="cam-zone-overlay">
             <svg viewBox={`0 0 ${videoSize.width} ${videoSize.height}`} preserveAspectRatio="xMidYMid slice" aria-hidden="true">

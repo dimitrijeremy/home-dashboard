@@ -1,32 +1,27 @@
 logLevel: info
 readTimeout: 30s
 writeTimeout: 30s
+api: yes
 
 # HLS settings
 hlsSegmentDuration: 4s
 hlsSegmentMaxSize: 50MB
 hlsAllowOrigins:
   - "*"
-hlsAlwaysRemux: yes
+# hlsAlwaysRemux HARUS off untuk mode on-demand — kalau on, muxer HLS menjadi
+# reader permanen sehingga publisher tidak pernah dimatikan saat idle.
+hlsAlwaysRemux: no
 
-# Architecture: mediamtx manages ffmpeg subprocesses directly via runOnInit.
-# start_stream.sh stores the DVR password — avoids mediamtx $VAR expansion issue.
-# runOnInitRestart: yes → mediamtx auto-restarts ffmpeg if it crashes.
+# Channel built-in NVR (ch1..chN) di-serve ON-DEMAND: ffmpeg hanya jalan saat
+# ada viewer/analyzer, dimatikan lagi setelah idle. Jalankan mediamtx dari
+# root repo: ./mediamtx mediamtx.yml
 paths:
-  ch1:
-    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 1
-    runOnInitRestart: yes
-
-  ch2:
-    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 2
-    runOnInitRestart: yes
-
-  ch3:
-    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 3
-    runOnInitRestart: yes
-
-  ch4:
-    runOnInit: /Users/dimitrijeremy/Documents/home-dashboard/home-dashboard/start_stream.sh 4
-    runOnInitRestart: yes
+  '~^ch([0-9]+)$':
+    runOnDemand: ./start_stream.sh $MTX_PATH
+    runOnDemandRestart: yes
+    # NVR Dahua lewat RTSPS bisa lambat handshake TLS; beri ruang cukup
+    # supaya publisher tidak keburu dibunuh sebelum stream sempat mulai.
+    runOnDemandStartTimeout: 45s
+    runOnDemandCloseAfter: 60s
 
   '~^custom_[0-9a-f]+$': {}

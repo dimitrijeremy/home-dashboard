@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { fetchCameras, addCamera, deleteCamera, fetchStreamStatus, restartStream, restartAllStreams, fetchMode, postMode, fetchZones } from '../services/api'
 import CCTVPlayer from '../features/cctv/CCTVPlayer'
 import AddChannelModal from '../features/cctv/AddChannelModal'
+import EditChannelModal from '../features/cctv/EditChannelModal'
 import SmartControls from '../features/smarthome/SmartControls'
 import WeatherWidget from '../features/weather/WeatherWidget'
 
@@ -222,6 +223,7 @@ export default function Dashboard({ onConfig }) {
   const [zones,       setZones]       = useState([])
   const [error,       setError]       = useState(null)
   const [showModal,   setShowModal]   = useState(false)
+  const [editCam,     setEditCam]     = useState(null)
   const [showStatus,  setShowStatus]  = useState(false)
   const [showZones,   setShowZones]   = useState(loadShowZones)
   const [viewMode,    setViewMode]    = useState('grid2')
@@ -288,8 +290,8 @@ export default function Dashboard({ onConfig }) {
       .finally(() => setModeLoading(false))
   }
 
-  const handleAdd = async (name, rtspUrl, channel) => {
-    await addCamera(name, rtspUrl, channel)
+  const handleAdd = async (name, rtspUrl, channel, ptzSupported = false) => {
+    await addCamera(name, rtspUrl, channel, ptzSupported)
     await reload()
   }
 
@@ -402,12 +404,15 @@ export default function Dashboard({ onConfig }) {
                 {cams.map(cam => (
                   <CCTVPlayer
                     key={cam.id}
+                    camId={cam.id}
                     src={cam.stream_url}
                     name={cam.name}
                     zones={enabledZonesByCamera[cam.id] || []}
                     showZones={showZones}
                     removable={!cam.builtin}
                     onRemove={() => handleRemove(cam.id)}
+                    onEdit={() => setEditCam(cam)}
+                    ptzSupported={cam.ptz_supported === 1}
                   />
                 ))}
               </div>
@@ -419,6 +424,13 @@ export default function Dashboard({ onConfig }) {
 
       {showModal && (
         <AddChannelModal onAdd={handleAdd} onClose={() => setShowModal(false)} />
+      )}
+      {editCam && (
+        <EditChannelModal
+          camera={editCam}
+          onSaved={() => reload()}
+          onClose={() => setEditCam(null)}
+        />
       )}
       <AlertToasts alerts={alerts} onDismiss={dismissAlert} />
     </div>

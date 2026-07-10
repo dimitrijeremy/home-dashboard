@@ -18,24 +18,22 @@ hlsSegmentMaxSize: 50MB
 hlsVariant: mpegts
 # hlsAllowOrigins:
 #   - "*"
-hlsAlwaysRemux: yes
+# hlsAlwaysRemux HARUS off untuk mode on-demand — kalau on, muxer HLS menjadi
+# reader permanen sehingga publisher tidak pernah dimatikan saat idle.
+hlsAlwaysRemux: no
 
-# start_stream.sh di-mount ke /app/ via docker-compose volume
+# start_stream.sh di-mount ke /app/ via docker-compose volume.
+# Channel built-in NVR (ch1, ch2, …, chN) di-serve ON-DEMAND:
+# ffmpeg hanya dijalankan saat ada viewer/analyzer yang membaca path,
+# dan dimatikan lagi setelah idle (runOnDemandCloseAfter). Jumlah channel
+# tidak lagi hardcode — cukup atur builtin_channel_count di dashboard.
 paths:
-  ch1:
-    runOnInit: /app/start_stream.sh 1
-    runOnInitRestart: yes
-
-  ch2:
-    runOnInit: /app/start_stream.sh 2
-    runOnInitRestart: yes
-
-  ch3:
-    runOnInit: /app/start_stream.sh 3
-    runOnInitRestart: yes
-
-  ch4:
-    runOnInit: /app/start_stream.sh 4
-    runOnInitRestart: yes
+  '~^ch([0-9]+)$':
+    runOnDemand: /app/start_stream.sh $MTX_PATH
+    runOnDemandRestart: yes
+    # NVR Dahua lewat RTSPS bisa lambat handshake TLS; beri ruang cukup
+    # supaya publisher tidak keburu dibunuh sebelum stream sempat mulai.
+    runOnDemandStartTimeout: 45s
+    runOnDemandCloseAfter: 60s
 
   '~^custom_[0-9a-f]+$': {}

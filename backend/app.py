@@ -15,7 +15,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 import requests
 from requests.auth import HTTPDigestAuth
@@ -100,10 +100,13 @@ def _mtx_kick_publisher(path_seg):
     return _mtx_api_request("POST", f"/v3/rtspsessions/kick/{source['id']}") is not None
 
 # ── NVR Config ──────────────────────────────────────────────
-DVR_HOST      = os.getenv("DVR_HOST", "10.10.30.2")
+# Nilai env hanya dipakai sebagai seed awal; nilai aktif disimpan di tabel
+# settings (editable dari menu konfigurasi dashboard). Tidak ada default
+# kredensial/host di kode.
+DVR_HOST      = os.getenv("DVR_HOST", "")
 DVR_HTTP_PORT = int(os.getenv("DVR_HTTP_PORT", "80"))
-DVR_USER      = os.getenv("DVR_USER", "dashboard")
-DVR_PASS      = os.getenv("DVR_PASS", "d4$hb0ard-dlt")
+DVR_USER      = os.getenv("DVR_USER", "")
+DVR_PASS      = os.getenv("DVR_PASS", "")
 # Separate credentials for the event stream (needs operator/admin on Dahua).
 # Falls back to DVR_USER/DVR_PASS if not configured.
 DVR_EVENT_USER = os.getenv("DVR_EVENT_USER") or DVR_USER
@@ -160,7 +163,8 @@ def _should_capture_event_snapshot(code, action):
 
 
 def _capture_nvr_event_snapshot(channel_number, code):
-    if not channel_number or not DVR_HOST:
+    nvr_host = _get_nvr_host()
+    if not channel_number or not nvr_host:
         return None
 
     os.makedirs(NVR_EVENT_SNAPSHOT_DIR, exist_ok=True)
@@ -170,7 +174,7 @@ def _capture_nvr_event_snapshot(channel_number, code):
         f"ch{channel_number}_{safe_code}_{uuid4().hex[:8]}.jpg"
     )
     snapshot_path = os.path.join(NVR_EVENT_SNAPSHOT_DIR, snapshot_name)
-    snapshot_url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/snapshot.cgi?action=get&channel={channel_number}"
+    snapshot_url = f"http://{nvr_host}:{_get_nvr_http_port()}/cgi-bin/snapshot.cgi?action=get&channel={channel_number}"
 
     last_error = "snapshot unavailable"
     for user, passwd in _nvr_auth_candidates():
@@ -355,6 +359,12 @@ def ensure_camera_columns(con):
         con.execute("ALTER TABLE cameras ADD COLUMN rtsp_url TEXT")
     if "channel" not in existing:
         con.execute("ALTER TABLE cameras ADD COLUMN channel INTEGER")
+    if "ai_enabled" not in existing:
+        con.execute("ALTER TABLE cameras ADD COLUMN ai_enabled INTEGER NOT NULL DEFAULT 1")
+    if "ptz_supported" not in existing:
+        # Default 0 — tidak semua channel NVR punya motor PTZ (speed dome).
+        # User menyalakan manual per kamera lewat modal edit.
+        con.execute("ALTER TABLE cameras ADD COLUMN ptz_supported INTEGER NOT NULL DEFAULT 0")
 
 
 def ensure_detection_columns(con):
@@ -471,24 +481,39 @@ def stop_all_custom_streams():
         stop_custom_stream(path_name)
 
 
+def _builtin_channel_count(con):
+    row = con.execute("SELECT value FROM settings WHERE key='builtin_channel_count'").fetchone()
+    try:
+        count = int(row[0]) if row else 4
+    except (TypeError, ValueError):
+        count = 4
+    return max(0, min(count, 64))
+
+
 def sync_camera_rows(con):
+    channel_count = _builtin_channel_count(con)
     builtin_rows = con.execute(
         "SELECT id FROM cameras WHERE builtin=1 ORDER BY sort_order, id"
     ).fetchall()
 
-    for channel in range(1, 5):
+    for channel in range(1, channel_count + 1):
         stream_url = _public_stream_url(f"ch{channel}")
-        name = f"Camera {channel}"
         if channel <= len(builtin_rows):
+            # Nama kamera milik user (editable) — jangan ditimpa, cukup sinkronkan
+            # stream_url/urutan/nomor channel dengan runtime saat ini.
             con.execute(
-                "UPDATE cameras SET name=?, stream_url=?, sort_order=? WHERE id=?",
-                (name, stream_url, channel, builtin_rows[channel - 1][0]),
+                "UPDATE cameras SET stream_url=?, sort_order=?, channel=? WHERE id=?",
+                (stream_url, channel, channel, builtin_rows[channel - 1][0]),
             )
         else:
             con.execute(
                 "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel) VALUES (?,?,?,?,?,?)",
-                (name, stream_url, channel, 1, None, None),
+                (f"Camera {channel}", stream_url, channel, 1, None, channel),
             )
+
+    # Jika jumlah channel builtin dikurangi, hapus baris berlebih
+    for extra in builtin_rows[channel_count:]:
+        con.execute("DELETE FROM cameras WHERE id=?", (extra[0],))
 
     custom_rows = con.execute(
         "SELECT id, stream_url FROM cameras WHERE builtin=0"
@@ -565,8 +590,11 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
-    # Seed default settings
+    # Seed default settings (env hanya jadi nilai awal; selanjutnya dikelola via UI)
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('mode', 'home')")
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_host', ?)", (DVR_HOST,))
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_http_port', ?)", (str(DVR_HTTP_PORT),))
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('builtin_channel_count', ?)", (os.getenv("NVR_CHANNELS", "4"),))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_stream_user', ?)" , (DVR_USER,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_stream_pass', ?)" , (DVR_PASS,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_event_user', ?)" , (DVR_EVENT_USER,))
@@ -583,7 +611,7 @@ def init_db():
 @app.route('/api/cameras', methods=['GET'])
 def get_cameras():
     rows = get_db().execute(
-        "SELECT id, name, stream_url, builtin FROM cameras ORDER BY sort_order, id"
+        "SELECT id, name, stream_url, builtin, rtsp_url, channel, ai_enabled, ptz_supported FROM cameras ORDER BY sort_order, id"
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -644,10 +672,11 @@ def add_camera():
             if existing:
                 return jsonify(dict(existing)), 200
 
+        ptz_supported = 1 if body.get('ptz_supported') else 0
         max_order = db.execute("SELECT COALESCE(MAX(sort_order),0) FROM cameras").fetchone()[0]
         cur = db.execute(
-            "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel) VALUES (?,?,?,0,?,?)",
-            (name, stream_url, max_order + 1, custom_rtsp_url, custom_channel)
+            "INSERT INTO cameras (name, stream_url, sort_order, builtin, rtsp_url, channel, ptz_supported) VALUES (?,?,?,0,?,?,?)",
+            (name, stream_url, max_order + 1, custom_rtsp_url, custom_channel, ptz_supported)
         )
         db.commit()
         camera_id = cur.lastrowid
@@ -660,7 +689,8 @@ def add_camera():
             stream_warning = str(e)[:160]
             print(f"[STREAM] launch failed for {path_name}: {e}", flush=True)
 
-    payload = {'id': camera_id, 'name': name, 'stream_url': stream_url, 'builtin': 0}
+    payload = {'id': camera_id, 'name': name, 'stream_url': stream_url, 'builtin': 0,
+               'ptz_supported': ptz_supported}
     if stream_warning:
         payload['stream_warning'] = stream_warning
     return jsonify(payload), 201
@@ -685,30 +715,73 @@ def delete_camera(cam_id):
 @app.route('/api/cameras/<int:cam_id>', methods=['PATCH'])
 def update_camera(cam_id):
     db = get_db()
-    row = db.execute("SELECT id FROM cameras WHERE id=?", (cam_id,)).fetchone()
+    row = db.execute(
+        "SELECT id, builtin, stream_url, rtsp_url, channel FROM cameras WHERE id=?", (cam_id,)
+    ).fetchone()
     if not row:
         return jsonify({'error': 'not found'}), 404
 
     body = request.get_json(silent=True) or {}
     fields, vals = [], []
     if 'name' in body:
-        name = body['name'].strip()
+        name = (body['name'] or '').strip()
         if not name:
             return jsonify({'error': 'name cannot be empty'}), 400
         fields.append('name=?'); vals.append(name)
+    if 'ai_enabled' in body:
+        fields.append('ai_enabled=?'); vals.append(1 if body['ai_enabled'] else 0)
+    if 'ptz_supported' in body:
+        fields.append('ptz_supported=?'); vals.append(1 if body['ptz_supported'] else 0)
     if 'stream_url' in body:
-        url = body['stream_url'].strip()
+        if row['builtin']:
+            return jsonify({'error': 'stream_url kamera built-in dikelola sistem'}), 403
+        url = (body['stream_url'] or '').strip()
         if not url.startswith('http'):
             return jsonify({'error': 'stream_url must start with http'}), 400
         fields.append('stream_url=?'); vals.append(url)
 
+    # Edit sumber RTSP / nomor channel untuk kamera custom → relaunch publisher
+    new_rtsp = None
+    new_channel = None
+    if 'rtsp_url' in body or 'channel' in body:
+        if row['builtin']:
+            return jsonify({'error': 'sumber RTSP kamera built-in diatur lewat konfigurasi NVR'}), 403
+        new_rtsp = (body.get('rtsp_url') if 'rtsp_url' in body else row['rtsp_url']) or ''
+        new_rtsp = new_rtsp.strip()
+        channel_raw = body.get('channel') if 'channel' in body else row['channel']
+        channel_str = str(channel_raw if channel_raw is not None else '').strip()
+        if not new_rtsp:
+            return jsonify({'error': 'rtsp_url is required'}), 400
+        if not channel_str.isdigit() or int(channel_str) <= 0:
+            return jsonify({'error': 'channel must be a positive integer'}), 400
+        new_channel = int(channel_str)
+        fields.append('rtsp_url=?'); vals.append(new_rtsp)
+        fields.append('channel=?'); vals.append(new_channel)
+
     if fields:
         vals.append(cam_id)
-        db.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", vals)
-        db.commit()
+        with _camera_write_lock:
+            db.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id=?", vals)
+            db.commit()
 
-    updated = db.execute("SELECT id, name, stream_url, builtin FROM cameras WHERE id=?", (cam_id,)).fetchone()
-    return jsonify(dict(updated))
+    stream_warning = None
+    if new_rtsp and new_channel:
+        path_name = extract_custom_path_name(row['stream_url'])
+        if path_name:
+            try:
+                launch_custom_stream(path_name, new_rtsp, new_channel)
+            except Exception as e:
+                stream_warning = str(e)[:160]
+                print(f"[STREAM] relaunch failed for {path_name}: {e}", flush=True)
+
+    updated = db.execute(
+        "SELECT id, name, stream_url, builtin, rtsp_url, channel, ai_enabled, ptz_supported FROM cameras WHERE id=?",
+        (cam_id,),
+    ).fetchone()
+    payload = dict(updated)
+    if stream_warning:
+        payload['stream_warning'] = stream_warning
+    return jsonify(payload)
 
 
 @app.route('/api/stream-status', methods=['GET'])
@@ -770,9 +843,11 @@ def restart_stream(cam_id):
         return jsonify({'error': 'not found'}), 404
 
     if row['builtin']:
-        # Kill ffmpeg pushing to this path — mediamtx runOnInitRestart respawns it
+        # Kick publisher via MediaMTX API — mediamtx respawns it (runOnInit/runOnDemand).
+        # Fallback pkill hanya berguna saat backend & mediamtx berjalan di host yang sama.
         path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]  # e.g. "ch1"
-        _restart_host_rtsp_publisher(path_seg)
+        if not _mtx_kick_publisher(path_seg):
+            _restart_host_rtsp_publisher(path_seg)
     else:
         path_name = extract_custom_path_name(row['stream_url'])
         if path_name and row['rtsp_url'] and row['channel']:
@@ -790,13 +865,104 @@ def restart_all_streams():
     for row in rows:
         if row['builtin']:
             path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]
-            _restart_host_rtsp_publisher(path_seg)
+            if not _mtx_kick_publisher(path_seg):
+                _restart_host_rtsp_publisher(path_seg)
         else:
             path_name = extract_custom_path_name(row['stream_url'])
             if path_name and row['rtsp_url'] and row['channel']:
                 stop_custom_stream(path_name)
                 launch_custom_stream(path_name, row['rtsp_url'], row['channel'])
     return jsonify({'ok': True})
+
+
+# ── PTZ Control ─────────────────────────────────────────────────────────────
+
+PTZ_CODES = {
+    "Up", "Down", "Left", "Right",
+    "LeftUp", "RightUp", "LeftDown", "RightDown",
+    "ZoomTele", "ZoomWide", "FocusNear", "FocusFar",
+    "IrisLarge", "IrisSmall",
+}
+
+
+def _camera_nvr_channel(row):
+    """Tentukan nomor channel NVR sebuah kamera untuk perintah PTZ."""
+    if row['channel']:
+        return int(row['channel'])
+    path_seg = urlsplit(row['stream_url']).path.strip('/').split('/')[0]
+    match = re.fullmatch(r'ch(\d+)', path_seg)
+    return int(match.group(1)) if match else None
+
+
+def _camera_ptz_target(row):
+    """Tentukan (host, port, kandidat kredensial) tujuan perintah PTZ.
+
+    Kamera custom (punya rtsp_url) → host + kredensial diambil dari sumber
+    RTSP-nya sendiri: kamera IP PTZ berdiri sendiri menerima ptz.cgi di IP-nya,
+    bukan di NVR. Kredensial NVR tetap dicoba sebagai fallback.
+    Kamera built-in → NVR utama dari konfigurasi.
+    """
+    if row['rtsp_url']:
+        parts = urlsplit(row['rtsp_url'])
+        if parts.hostname:
+            creds = []
+            if parts.username:
+                creds.append((unquote(parts.username), unquote(parts.password or '')))
+            for pair in _nvr_auth_candidates():
+                if pair not in creds:
+                    creds.append(pair)
+            port = int(os.getenv("CAMERA_HTTP_PORT", "80"))
+            return parts.hostname, port, creds
+    return _get_nvr_host(), _get_nvr_http_port(), _nvr_auth_candidates()
+
+
+@app.route('/api/cameras/<int:cam_id>/ptz', methods=['POST'])
+def camera_ptz(cam_id):
+    row = get_db().execute(
+        "SELECT id, builtin, stream_url, rtsp_url, channel, ptz_supported FROM cameras WHERE id=?", (cam_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    if not row['ptz_supported']:
+        return jsonify({'error': 'kamera ini tidak ditandai mendukung PTZ'}), 400
+
+    body = request.get_json(silent=True) or {}
+    action = body.get('action')
+    code = body.get('code')
+    if action not in {'start', 'stop'}:
+        return jsonify({'error': "action must be 'start' or 'stop'"}), 400
+    if code not in PTZ_CODES:
+        return jsonify({'error': f'code must be one of {sorted(PTZ_CODES)}'}), 400
+    try:
+        speed = int(body.get('speed', 4))
+    except (TypeError, ValueError):
+        speed = 4
+    speed = min(max(speed, 1), 8)
+
+    channel = _camera_nvr_channel(row)
+    if not channel:
+        return jsonify({'error': 'kamera ini tidak punya nomor channel NVR'}), 400
+
+    ptz_host, ptz_port, auth_candidates = _camera_ptz_target(row)
+    if not ptz_host:
+        return jsonify({'error': 'NVR host belum dikonfigurasi'}), 503
+
+    url = (
+        f"http://{ptz_host}:{ptz_port}/cgi-bin/ptz.cgi"
+        f"?action={action}&channel={channel}&code={code}&arg1=0&arg2={speed}&arg3=0"
+    )
+    last_error = 'PTZ request failed'
+    for user, passwd in auth_candidates:
+        try:
+            resp = requests.get(url, auth=HTTPDigestAuth(user, passwd), timeout=(5, 8))
+        except Exception as exc:
+            last_error = str(exc)[:160]
+            continue
+        if resp.status_code == 200:
+            return jsonify({'ok': True})
+        last_error = f"HTTP {resp.status_code}"
+
+    return jsonify({'ok': False, 'error': last_error}), 502
 
 
 # ── NVR Credential helpers ──────────────────────────────────────────────────
@@ -818,6 +984,18 @@ def _set_db_setting(key, value):
     con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
     con.commit()
     con.close()
+
+
+def _get_nvr_host():
+    """Host NVR aktif — DB dulu, fallback env."""
+    return _db_setting('nvr_host') or DVR_HOST
+
+
+def _get_nvr_http_port():
+    try:
+        return int(_db_setting('nvr_http_port') or DVR_HTTP_PORT)
+    except (TypeError, ValueError):
+        return DVR_HTTP_PORT
 
 
 def _get_nvr_event_creds():
@@ -846,11 +1024,12 @@ def _nvr_auth_candidates():
 
 
 def _nvr_cgi_text(path, timeout=8):
-    if not DVR_HOST:
+    nvr_host = _get_nvr_host()
+    if not nvr_host:
         raise RuntimeError('NVR host is not configured')
 
     last_error = 'NVR request failed'
-    url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}{path}"
+    url = f"http://{nvr_host}:{_get_nvr_http_port()}{path}"
     for user, passwd in _nvr_auth_candidates():
         try:
             resp = requests.get(url, auth=HTTPDigestAuth(user, passwd), timeout=(5, timeout))
@@ -926,8 +1105,8 @@ def _build_nvr_info_payload():
         event_status = dict(_nvr_status)
 
     return {
-        'host': DVR_HOST,
-        'http_port': DVR_HTTP_PORT,
+        'host': _get_nvr_host(),
+        'http_port': _get_nvr_http_port(),
         'device': {
             'model': device_type.get('type') or system_info.get('updateSerial') or '',
             'type_code': system_info.get('deviceType') or '',
@@ -963,14 +1142,20 @@ _NVR_BACKOFF_MAX = 900  # Dahua RmLock ≤ 850 s; 15 min ensures unlock
 def _nvr_event_worker():
     """Background daemon thread: subscribe to Dahua NVR event stream."""
     global _nvr_backoff
-    if not DVR_HOST:
-        return
     # Initial startup delay: wait before first attempt to avoid hammering NVR
     # immediately on container start (which can trigger account lockout).
     time.sleep(60)
-    url = f"http://{DVR_HOST}:{DVR_HTTP_PORT}/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5"
     while True:
-        # Re-read credentials from DB each reconnect so config changes take effect
+        # Re-read host + credentials from DB each reconnect so config changes take effect
+        nvr_host = _get_nvr_host()
+        if not nvr_host:
+            with _nvr_lock:
+                _nvr_status["connected"] = False
+                _nvr_status["error"] = "NVR host belum dikonfigurasi"
+                _nvr_bump_locked()
+            time.sleep(30)
+            continue
+        url = f"http://{nvr_host}:{_get_nvr_http_port()}/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5"
         event_user, event_pass = _get_nvr_event_creds()
         auth = HTTPDigestAuth(event_user, event_pass)
         try:
@@ -1133,8 +1318,8 @@ def get_nvr_config():
     event_user = _db_setting('nvr_event_user') or DVR_EVENT_USER
     event_pass = _db_setting('nvr_event_pass') or DVR_EVENT_PASS
     return jsonify({
-        'host': DVR_HOST,
-        'http_port': DVR_HTTP_PORT,
+        'host': _get_nvr_host(),
+        'http_port': _get_nvr_http_port(),
         'stream_user': stream_user,
         'stream_pass': stream_pass,
         'event_user': event_user,
@@ -1154,6 +1339,21 @@ def get_nvr_info():
 def set_nvr_config():
     body = request.get_json(silent=True) or {}
     updated = {}
+    if 'host' in body:
+        val = (body['host'] or '').strip()
+        if not val:
+            return jsonify({'error': 'host cannot be empty'}), 400
+        _set_db_setting('nvr_host', val)
+        updated['host'] = val
+    if 'http_port' in body:
+        try:
+            port = int(body['http_port'])
+        except (TypeError, ValueError):
+            return jsonify({'error': 'http_port must be a number'}), 400
+        if not (0 < port < 65536):
+            return jsonify({'error': 'http_port out of range'}), 400
+        _set_db_setting('nvr_http_port', str(port))
+        updated['http_port'] = port
     if 'stream_user' in body:
         val = (body['stream_user'] or '').strip()
         if not val:
