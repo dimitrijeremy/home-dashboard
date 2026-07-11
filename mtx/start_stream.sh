@@ -39,10 +39,36 @@ if [ -n "$CONFIG_JSON" ]; then
   H=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("host") or "")' 2>/dev/null || true)
   U=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stream_user") or "")' 2>/dev/null || true)
   P=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stream_pass") or "")' 2>/dev/null || true)
+  Q=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stream_quality") or "")' 2>/dev/null || true)
   if [ -n "$H" ]; then DVR_HOST_VAL=$H; fi
   if [ -n "$U" ]; then DVR_USER_VAL=$U; fi
   if [ -n "$P" ]; then DVR_PASS_VAL=$P; fi
 fi
+
+# Kualitas stream dari setting dashboard (stream_quality):
+#   source — main stream tanpa scale; 720/480 — scale turun + bitrate rendah;
+#   sub — substream NVR (subtype=1), paling hemat CPU/bandwidth.
+SCALE_ARGS=''
+case "${Q:-source}" in
+  sub)
+    STREAM_SUBTYPE=1
+    VIDEO_BITRATE=${STREAM_VIDEO_BITRATE:-1000k}
+    MAXRATE_VALUE=${STREAM_MAXRATE:-1200k}
+    BUFSIZE_VALUE=${STREAM_BUFSIZE:-2400k}
+    ;;
+  720)
+    SCALE_ARGS='-vf scale=-2:720'
+    VIDEO_BITRATE=${STREAM_VIDEO_BITRATE:-1500k}
+    MAXRATE_VALUE=${STREAM_MAXRATE:-1800k}
+    BUFSIZE_VALUE=${STREAM_BUFSIZE:-3600k}
+    ;;
+  480)
+    SCALE_ARGS='-vf scale=-2:480'
+    VIDEO_BITRATE=${STREAM_VIDEO_BITRATE:-800k}
+    MAXRATE_VALUE=${STREAM_MAXRATE:-1000k}
+    BUFSIZE_VALUE=${STREAM_BUFSIZE:-2000k}
+    ;;
+esac
 
 if [ -z "$DVR_HOST_VAL" ]; then
   echo "[stream] NVR host belum dikonfigurasi (menu konfigurasi dashboard / env DVR_HOST)" >&2
@@ -60,12 +86,14 @@ exec ffmpeg \
   -hide_banner -loglevel warning \
   -rtsp_transport tcp \
   -i "$SOURCE_URL" \
+  $SCALE_ARGS \
   -c:v libx264 \
   -preset ultrafast \
   -tune zerolatency \
   -pix_fmt yuv420p \
   -g 25 \
   -keyint_min 25 \
+  -force_key_frames 'expr:gte(t,n_forced*1)' \
   -sc_threshold 0 \
   -b:v "$VIDEO_BITRATE" \
   -maxrate "$MAXRATE_VALUE" \

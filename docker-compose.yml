@@ -55,6 +55,8 @@ services:
       - RTSP_PORT=8554
     volumes:
       - camera_data:/data
+      # Docker socket (read-only) untuk panel resource server di dashboard
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - hd-net
     restart: unless-stopped
@@ -80,9 +82,6 @@ services:
     networks:
       - hd-net
     restart: unless-stopped
-    # Analyzer opsional — tidak ikut 'docker compose up' biasa
-    profiles:
-      - ai
 
   frontend:
     build: ./frontend

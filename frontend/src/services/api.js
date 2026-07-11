@@ -49,6 +49,25 @@ export async function ptzCommand(id, action, code, speed = 4) {
   return res.json()
 }
 
+export async function reorderCameras(order) {
+  const res = await fetch(url('/api/cameras/reorder'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to reorder cameras')
+  }
+  return res.json()
+}
+
+export async function fetchServerStats() {
+  const res = await fetch(url('/api/server-stats'))
+  if (!res.ok) throw new Error('Failed to fetch server stats')
+  return res.json()
+}
+
 export async function deleteCamera(id) {
   const res = await fetch(url(`/api/cameras/${id}`), { method: 'DELETE' })
   if (!res.ok && res.status !== 204) {

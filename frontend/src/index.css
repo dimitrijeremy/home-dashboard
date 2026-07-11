@@ -105,7 +105,9 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .btn-icon{background:none;border:none;cursor:pointer;color:var(--text-muted);padding:4px;border-radius:4px;font-size:.85rem;line-height:1;transition:color .15s}
 .btn-icon:hover{color:var(--text)}
 .cam-video{width:100%;height:0;padding-bottom:56.25%;position:relative;background:#000}
-.cam-video video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+/* contain (bukan cover): substream 4:3 tidak boleh ter-crop/zoom di kotak 16:9.
+   Harus sinkron dengan preserveAspectRatio="xMidYMid meet" di overlay zona. */
+.cam-video video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .cam-zone-overlay{position:absolute;inset:0;pointer-events:none;z-index:2}
 .cam-zone-overlay svg{width:100%;height:100%;display:block}
 .cam-zone-polygon{fill:rgba(59,130,246,.16);stroke:#93c5fd;stroke-width:4;vector-effect:non-scaling-stroke}
@@ -115,6 +117,33 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .cam-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}
 .cam-spinner{width:28px;height:28px;border:3px solid rgba(255,255,255,.15);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── Camera drag arrange ── */
+.cam-drag-handle{cursor:grab;color:var(--text-muted);font-size:.85rem;padding:4px;border-radius:4px;user-select:none;line-height:1}
+.cam-drag-handle:hover{color:var(--text);background:var(--surface2)}
+.cam-drag-handle:active{cursor:grabbing}
+.cam-card.drag-over{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-glow)}
+.cam-card.dragging{opacity:.45}
+
+/* ── Server resource stats ── */
+.server-stats{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.server-stats-loading{color:var(--text-muted);font-size:.78rem;padding:6px 0}
+.stat-row{display:flex;flex-direction:column;gap:4px}
+.stat-row-head{display:flex;align-items:center;justify-content:space-between;font-size:.72rem}
+.stat-row-head span{color:var(--text-muted)}
+.stat-row-head strong{font-variant-numeric:tabular-nums;font-size:.74rem}
+.stat-bar{height:5px;background:var(--bg);border-radius:3px;overflow:hidden}
+.stat-bar-fill{height:100%;border-radius:3px;background:var(--accent);transition:width .5s ease}
+.stat-bar-fill.warn{background:var(--yellow)}
+.stat-bar-fill.crit{background:var(--red)}
+.server-stats-divider{border-top:1px solid var(--border);margin:2px 0}
+.container-stat-row{display:flex;align-items:center;gap:8px;font-size:.72rem;padding:2px 0}
+.container-stat-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.container-stat-dot.running{background:var(--green)}
+.container-stat-dot.stopped{background:var(--text-muted)}
+.container-stat-name{flex:1;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.container-stat-vals{color:var(--text-muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.server-stats-footer{font-size:.66rem;color:var(--text-muted);text-align:right}
 
 /* ── Buttons ── */
 .btn{display:inline-flex;align-items:center;gap:7px;padding:7px 14px;border-radius:var(--r-sm);font-size:.8rem;font-weight:600;cursor:pointer;transition:.2s;border:1px solid transparent}
@@ -256,7 +285,10 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .zone-editor{display:flex;flex-direction:column;gap:14px}
 .zone-canvas-wrap{position:relative;background:#000;border-radius:var(--r);overflow:hidden;border:1px solid var(--border);line-height:0}
 .zone-canvas-wrap.is-placeholder{display:flex;align-items:center;justify-content:center;min-height:240px;padding:20px;line-height:1.4}
-.zone-snap-img{width:100%;display:block;max-height:480px;object-fit:contain}
+/* PENTING: box <img> harus sama persis dengan konten gambar — canvas klik zona
+   di-overlay inset:0. object-fit:contain + max-height membuat letterbox sehingga
+   koordinat normalisasi zona tersimpan salah (tampil bergeser & mengecil). */
+.zone-snap-img{width:100%;height:auto;display:block}
 .zone-canvas{position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair}
 .zone-canvas.readonly{cursor:default}
 .zone-snap-loading{padding:48px;text-align:center;color:var(--text-muted);font-size:.82rem}

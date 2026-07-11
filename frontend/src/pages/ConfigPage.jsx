@@ -23,6 +23,7 @@ export default function ConfigPage({ onBack }) {
   const [streamPass, setStreamPass] = useState('')
   const [nvrUser, setNvrUser]     = useState('')
   const [nvrPass, setNvrPass]     = useState('')
+  const [streamQuality, setStreamQuality] = useState('source')
   const [showPass, setShowPass]   = useState(false)
   const [nvrSaving, setNvrSaving] = useState(false)
   const [nvrMsg, setNvrMsg]       = useState(null)  // { ok, text }
@@ -61,6 +62,7 @@ export default function ConfigPage({ onBack }) {
           setStreamPass(cfg.stream_pass || '')
           setNvrUser(cfg.event_user || '')
           setNvrPass(cfg.event_pass || '')
+          setStreamQuality(cfg.stream_quality || 'source')
         })
         .catch(() => setNvrMsg({ ok: false, text: 'Gagal memuat konfigurasi NVR' }))
 
@@ -83,8 +85,9 @@ export default function ConfigPage({ onBack }) {
         stream_pass: streamPass,
         event_user: nvrUser,
         event_pass: nvrPass,
+        stream_quality: streamQuality,
       })
-      setNvrMsg({ ok: true, text: 'Tersimpan. Channel built-in akan memakai host/kredensial baru saat stream direstart; event worker saat reconnect.' })
+      setNvrMsg({ ok: true, text: 'Tersimpan. Restart stream dari dashboard agar kualitas/kredensial baru dipakai; event worker saat reconnect.' })
     } catch (err) {
       setNvrMsg({ ok: false, text: err.message || 'Gagal menyimpan' })
     } finally {
@@ -251,6 +254,25 @@ export default function ConfigPage({ onBack }) {
                   placeholder="80"
                   required
                 />
+              </div>
+
+              <div className="nvr-cred-group-title">Kualitas Stream</div>
+              <div className="nvr-cred-field">
+                <label>Resolusi / Sumber Stream</label>
+                <select
+                  className="cam-selector-select"
+                  value={streamQuality}
+                  onChange={e => setStreamQuality(e.target.value)}
+                  style={{ width: '100%' }}
+                >
+                  <option value="source">Asli — main stream tanpa scale</option>
+                  <option value="720">720p — main stream di-scale (hemat sedang)</option>
+                  <option value="480">480p — main stream di-scale (hemat besar)</option>
+                  <option value="sub">Substream NVR — subtype 1 (paling hemat)</option>
+                </select>
+                <small style={{ fontSize: '.72rem', color: 'var(--text-muted)' }}>
+                  Berlaku untuk semua channel setelah stream direstart (tombol ↺ di dashboard).
+                </small>
               </div>
 
               <div className="nvr-cred-group-title">Stream CCTV Channel Built-in</div>

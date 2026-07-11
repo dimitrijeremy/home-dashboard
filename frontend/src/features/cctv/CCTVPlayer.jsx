@@ -131,9 +131,12 @@ function makeStripLLHlsLoader(HlsClass) {
 const HLS_CONFIG = {
   enableWorker: true,
   lowLatencyMode: false,        // use standard HLS — LL tags stripped by loader above
-  liveSyncDurationCount: 3,     // buffer 3 segments (~13s) behind live edge
-  liveMaxLatencyDurationCount: 10,
-  maxBufferLength: 20,
+  liveSyncDurationCount: 2,     // target ~2 segmen (±2 dtk) di belakang live edge
+  liveMaxLatencyDurationCount: 8,  // lebih jauh dari ini → seek ke live edge
+  // Kejar ketinggalan dengan mempercepat playback alih-alih membiarkan delay
+  // menumpuk permanen setelah buffering/stall.
+  maxLiveSyncPlaybackRate: 1.5,
+  maxBufferLength: 12,
   maxBufferHole: 0.5,
   startLevel: -1,
   loader: makeStripLLHlsLoader(Hls),
@@ -157,7 +160,11 @@ const HLS_CONFIG = {
 
 const MAX_RETRIES = 5
 
-export default function CCTVPlayer({ camId, src, name, zones = [], showZones = false, onRemove, removable, onEdit, ptzSupported = false }) {
+export default function CCTVPlayer({
+  camId, src, name, zones = [], showZones = false, onRemove, removable, onEdit, ptzSupported = false,
+  isDragging = false, isDragOver = false,
+  onDragStartCam, onDragEndCam, onDragEnterCam, onDropCam,
+}) {
   const videoRef = useRef(null)
   const hlsRef   = useRef(null)
   const retryRef = useRef(null)
@@ -350,10 +357,29 @@ export default function CCTVPlayer({ camId, src, name, zones = [], showZones = f
         .filter((zone) => zone.parsedPoints.length >= 3)
     : []
 
+  const cardRef = useRef(null)
+
   return (
-    <div className="cam-card">
+    <div
+      ref={cardRef}
+      className={`cam-card${isDragging ? ' dragging' : ''}${isDragOver ? ' drag-over' : ''}`}
+      onDragOver={(e) => { e.preventDefault(); onDragEnterCam?.() }}
+      onDrop={(e) => { e.preventDefault(); onDropCam?.() }}
+    >
       <div className="cam-header">
         <div className="cam-title">
+          <span
+            className="cam-drag-handle"
+            title="Geser untuk mengatur posisi kamera"
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.effectAllowed = 'move'
+              // Drag image = seluruh kartu, bukan cuma handle kecil
+              if (cardRef.current) e.dataTransfer.setDragImage(cardRef.current, 40, 20)
+              onDragStartCam?.()
+            }}
+            onDragEnd={() => onDragEndCam?.()}
+          >⠿</span>
           <span className={`cam-status ${status}`} />
           {name}
         </div>
@@ -394,7 +420,9 @@ export default function CCTVPlayer({ camId, src, name, zones = [], showZones = f
         {showPtz && camId != null && ptzSupported && <PTZPad camId={camId} />}
         {overlayZones.length > 0 && (
           <div className="cam-zone-overlay">
-            <svg viewBox={`0 0 ${videoSize.width} ${videoSize.height}`} preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            {/* meet = object-fit:contain pada video; keduanya harus sama agar
+                polygon zona menempel tepat di konten video */}
+            <svg viewBox={`0 0 ${videoSize.width} ${videoSize.height}`} preserveAspectRatio="xMidYMid meet" aria-hidden="true">
               {overlayZones.map((zone, index) => {
                 const labelPoint = zone.parsedPoints[0]
                 return (

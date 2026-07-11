@@ -4,8 +4,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # ffmpeg diperlukan untuk launch custom RTSP stream ke mediamtx
+# socat: TLS bridge untuk kamera yang mewajibkan RTSPS tapi menolak request-line
+# berskema rtsps:// dari ffmpeg (mis. Dahua DH-P5AE-PV)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg socat && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { fetchCameras, addCamera, deleteCamera, fetchStreamStatus, restartStream, restartAllStreams, fetchMode, postMode, fetchZones } from '../services/api'
+import { fetchCameras, addCamera, deleteCamera, reorderCameras, fetchStreamStatus, restartStream, restartAllStreams, fetchMode, postMode, fetchZones } from '../services/api'
 import CCTVPlayer from '../features/cctv/CCTVPlayer'
 import AddChannelModal from '../features/cctv/AddChannelModal'
 import EditChannelModal from '../features/cctv/EditChannelModal'
 import SmartControls from '../features/smarthome/SmartControls'
 import WeatherWidget from '../features/weather/WeatherWidget'
+import ServerStats from '../features/system/ServerStats'
 
 const SHOW_ZONES_STORAGE_KEY = 'hd_show_zones'
 
@@ -300,6 +301,27 @@ export default function Dashboard({ onConfig }) {
     setCams(prev => prev.filter(c => c.id !== id))
   }
 
+  // ── Drag & drop urutan kamera ──
+  const [draggingId, setDraggingId] = useState(null)
+  const [dragOverId, setDragOverId] = useState(null)
+
+  const handleDropOn = (targetId) => {
+    const sourceId = draggingId
+    setDraggingId(null)
+    setDragOverId(null)
+    if (sourceId == null || sourceId === targetId) return
+    setCams(prev => {
+      const next = [...prev]
+      const from = next.findIndex(c => c.id === sourceId)
+      const to = next.findIndex(c => c.id === targetId)
+      if (from === -1 || to === -1) return prev
+      const [moved] = next.splice(from, 1)
+      next.splice(to, 0, moved)
+      reorderCameras(next.map(c => c.id)).catch(() => reload())
+      return next
+    })
+  }
+
   const cols = VIEW_MODES.find(m => m.id === viewMode)?.cols ?? 2
   const enabledZonesByCamera = zones.reduce((acc, zone) => {
     if (!zone.enabled) return acc
@@ -357,6 +379,13 @@ export default function Dashboard({ onConfig }) {
               </div>
               <SmartControls mode={mode} modeLoading={modeLoading} onModeChange={handleModeChange} />
             </div>
+
+            <div className="section">
+              <div className="section-header">
+                <div className="section-title">Server</div>
+              </div>
+              <ServerStats />
+            </div>
           </aside>
 
           {/* ── CCTV ── */}
@@ -413,6 +442,12 @@ export default function Dashboard({ onConfig }) {
                     onRemove={() => handleRemove(cam.id)}
                     onEdit={() => setEditCam(cam)}
                     ptzSupported={cam.ptz_supported === 1}
+                    isDragging={draggingId === cam.id}
+                    isDragOver={dragOverId === cam.id && draggingId !== cam.id}
+                    onDragStartCam={() => setDraggingId(cam.id)}
+                    onDragEndCam={() => { setDraggingId(null); setDragOverId(null) }}
+                    onDragEnterCam={() => { if (draggingId != null) setDragOverId(cam.id) }}
+                    onDropCam={() => handleDropOn(cam.id)}
                   />
                 ))}
               </div>

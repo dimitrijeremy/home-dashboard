@@ -53,6 +53,12 @@ NVR_EVENT_PREVIEW_CODES = {
 }
 NVR_EVENT_FETCH_LIMIT = 80
 
+# Pilihan kualitas stream (setting global, key 'stream_quality'):
+#   source — main stream apa adanya (subtype 0, tanpa scale)
+#   720 / 480 — main stream di-scale turun saat transcode (hemat bandwidth/encode)
+#   sub — pakai substream NVR/kamera (subtype 1) — paling hemat resource
+STREAM_QUALITIES = {"source", "720", "480", "sub"}
+
 
 def _public_stream_url(path_name):
     return f"{BASE_URL}/{path_name}/index.m3u8" if BASE_URL else f"/{path_name}/index.m3u8"
@@ -379,7 +385,7 @@ def ensure_nvr_event_columns(con):
         con.execute("ALTER TABLE nvr_events ADD COLUMN clip_path TEXT")
 
 
-def build_rtsp_source(rtsp_url, channel):
+def build_rtsp_source(rtsp_url, channel, quality="source"):
     base = rtsp_url.strip()
     if not base:
         raise ValueError("rtsp_url is required")
@@ -396,9 +402,126 @@ def build_rtsp_source(rtsp_url, channel):
         raise ValueError("unsupported rtsp_url scheme")
 
     pairs = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "channel"]
+    # Kualitas 'sub' → paksa substream Dahua (subtype=1) bila URL punya param subtype
+    if quality == "sub":
+        pairs = [(k, "1" if k == "subtype" else v) for k, v in pairs]
     pairs.insert(0, ("channel", channel_str))
 
     return urlunsplit(parts._replace(query=urlencode(pairs)))
+
+
+def _get_stream_quality():
+    val = _db_setting('stream_quality') or 'source'
+    return val if val in STREAM_QUALITIES else 'source'
+
+
+# ── Normalisasi URL RTSP kamera custom ───────────────────────────────────────
+# Beberapa kamera Dahua (mis. DH-P5AE-PV) MEWAJIBKAN TLS di port 554 dan
+# menolak param query unicast/proto/tls, sementara NVR justru toleran keduanya.
+# Supaya user tidak perlu tahu quirk per kamera saat menambah channel, probe
+# beberapa varian URL (DESCRIBE + digest auth) dan pakai yang dijawab kamera.
+
+def _strip_picky_params(url):
+    parts = urlsplit(url)
+    pairs = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in {"unicast", "proto", "tls"}]
+    return urlunsplit(parts._replace(query=urlencode(pairs)))
+
+
+def _flip_rtsp_scheme(url):
+    if url.startswith("rtsps://"):
+        return "rtsp://" + url[len("rtsps://"):]
+    if url.startswith("rtsp://"):
+        return "rtsps://" + url[len("rtsp://"):]
+    return url
+
+
+def _rtsp_describe_ok(url, timeout=4):
+    """DESCRIBE satu kali (plaintext atau TLS sesuai scheme). True bila 200 OK.
+    Request-line selalu memakai scheme rtsp:// — NVR menerima itu juga lewat
+    TLS, sedangkan kamera strict justru tidak membalas scheme rtsps://."""
+    import hashlib
+    import socket as _socket
+    import ssl as _ssl
+
+    parts = urlsplit(url)
+    if parts.scheme not in {"rtsp", "rtsps"}:
+        return False
+    host = parts.hostname
+    port = parts.port or 554
+    user = unquote(parts.username or "")
+    passwd = unquote(parts.password or "")
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+    uri = f"rtsp://{host}:{port}{path}"
+
+    try:
+        sock = _socket.create_connection((host, port), timeout=timeout)
+        if parts.scheme == "rtsps":
+            ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            # Kamera Dahua lama hanya punya cipher RSA-kex non-PFS
+            ctx.set_ciphers("ALL:@SECLEVEL=0")
+            sock = ctx.wrap_socket(sock)
+
+        def request(extra=""):
+            sock.sendall(
+                f"DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n{extra}\r\n".encode()
+            )
+            sock.settimeout(timeout)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode(errors="replace")
+
+        resp = request()
+        if resp.startswith("RTSP/1.0 200"):
+            return True
+        m = re.search(r'realm="([^"]+)"', resp)
+        n = re.search(r'nonce="([^"]+)"', resp)
+        if not (m and n and user):
+            return False
+        realm, nonce = m.group(1), n.group(1)
+        ha1 = hashlib.md5(f"{user}:{realm}:{passwd}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"DESCRIBE:{uri}".encode()).hexdigest()
+        digest = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        auth = (
+            f'Authorization: Digest username="{user}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{uri}", response="{digest}"\r\n'
+        )
+        return request(auth).startswith("RTSP/1.0 200")
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _normalize_rtsp_source(source_url):
+    """Kembalikan varian URL pertama yang dijawab kamera; fallback apa adanya.
+    Urutan disusun supaya kredensial benar tidak pernah 'gagal login' berulang
+    (lockout Dahua): varian paling mungkin dicoba lebih dulu."""
+    flipped = _flip_rtsp_scheme(source_url)
+    variants = []
+    for candidate in (
+        source_url,
+        _strip_picky_params(source_url),
+        _strip_picky_params(flipped),
+        flipped,
+    ):
+        if candidate not in variants:
+            variants.append(candidate)
+    for candidate in variants:
+        if _rtsp_describe_ok(candidate):
+            if candidate != source_url:
+                print(f"[STREAM] URL dinormalisasi: {source_url!r} -> {candidate!r}", flush=True)
+            return candidate
+    return source_url
 
 
 def extract_custom_path_name(stream_url):
@@ -450,13 +573,16 @@ def stop_custom_stream(path_name):
 
 def launch_custom_stream(path_name, rtsp_url, channel):
     stop_custom_stream(path_name)
-    source_url = build_rtsp_source(rtsp_url, channel)
+    quality = _get_stream_quality()
+    source_url = _normalize_rtsp_source(build_rtsp_source(rtsp_url, channel, quality=quality))
     log_handle = open(f"/tmp/{path_name}.log", "ab")
+    env = dict(os.environ, STREAM_QUALITY=quality)
     proc = subprocess.Popen(
         [CUSTOM_STREAM_SCRIPT, source_url, path_name],
         cwd=APP_DIR,
         stdout=log_handle,
         stderr=log_handle,
+        env=env,
     )
     CUSTOM_STREAM_PROCS[path_name] = {"proc": proc, "log": log_handle}
 
@@ -492,18 +618,22 @@ def _builtin_channel_count(con):
 
 def sync_camera_rows(con):
     channel_count = _builtin_channel_count(con)
+    # Mapping baris builtin → nomor channel mengikuti kolom channel (stabil),
+    # BUKAN sort_order — sort_order adalah urutan tampil yang bebas diatur user
+    # dan tidak boleh direset saat backend restart.
     builtin_rows = con.execute(
-        "SELECT id FROM cameras WHERE builtin=1 ORDER BY sort_order, id"
+        "SELECT id FROM cameras WHERE builtin=1 "
+        "ORDER BY CASE WHEN channel IS NULL THEN 1 ELSE 0 END, channel, id"
     ).fetchall()
 
     for channel in range(1, channel_count + 1):
         stream_url = _public_stream_url(f"ch{channel}")
         if channel <= len(builtin_rows):
-            # Nama kamera milik user (editable) — jangan ditimpa, cukup sinkronkan
-            # stream_url/urutan/nomor channel dengan runtime saat ini.
+            # Nama kamera & urutan tampil milik user (editable) — jangan ditimpa,
+            # cukup sinkronkan stream_url/nomor channel dengan runtime saat ini.
             con.execute(
-                "UPDATE cameras SET stream_url=?, sort_order=?, channel=? WHERE id=?",
-                (stream_url, channel, channel, builtin_rows[channel - 1][0]),
+                "UPDATE cameras SET stream_url=?, channel=? WHERE id=?",
+                (stream_url, channel, builtin_rows[channel - 1][0]),
             )
         else:
             con.execute(
@@ -782,6 +912,31 @@ def update_camera(cam_id):
     if stream_warning:
         payload['stream_warning'] = stream_warning
     return jsonify(payload)
+
+
+@app.route('/api/cameras/reorder', methods=['POST'])
+def reorder_cameras():
+    """Simpan urutan tampil kamera. Body: {"order": [id, id, ...]}."""
+    body = request.get_json(silent=True) or {}
+    order = body.get('order')
+    if not isinstance(order, list) or not order or not all(isinstance(i, int) for i in order):
+        return jsonify({'error': 'order must be a non-empty array of camera ids'}), 400
+
+    db = get_db()
+    known_ids = {r['id'] for r in db.execute("SELECT id FROM cameras").fetchall()}
+    unknown = [i for i in order if i not in known_ids]
+    if unknown:
+        return jsonify({'error': f'unknown camera ids: {unknown}'}), 400
+
+    with _camera_write_lock:
+        for position, cam_id in enumerate(order, start=1):
+            db.execute("UPDATE cameras SET sort_order=? WHERE id=?", (position, cam_id))
+        db.commit()
+
+    rows = db.execute(
+        "SELECT id, name, stream_url, builtin, rtsp_url, channel, ai_enabled, ptz_supported FROM cameras ORDER BY sort_order, id"
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route('/api/stream-status', methods=['GET'])
@@ -1324,6 +1479,7 @@ def get_nvr_config():
         'stream_pass': stream_pass,
         'event_user': event_user,
         'event_pass': event_pass,
+        'stream_quality': _get_stream_quality(),
     })
 
 
@@ -1378,6 +1534,12 @@ def set_nvr_config():
             return jsonify({'error': 'event_pass cannot be empty'}), 400
         _set_db_setting('nvr_event_pass', val)
         updated['event_pass'] = val
+    if 'stream_quality' in body:
+        val = (body['stream_quality'] or '').strip()
+        if val not in STREAM_QUALITIES:
+            return jsonify({'error': f'stream_quality must be one of {sorted(STREAM_QUALITIES)}'}), 400
+        _set_db_setting('stream_quality', val)
+        updated['stream_quality'] = val
     return jsonify({'ok': True, 'updated': list(updated.keys())})
 
 
@@ -1662,6 +1824,135 @@ def clear_detection_events():
     get_db().execute("DELETE FROM detection_events")
     get_db().commit()
     return jsonify({'ok': True})
+
+
+# ── Server Resource Stats ────────────────────────────────────────────────────
+
+DOCKER_SOCK = os.getenv("DOCKER_SOCK", "/var/run/docker.sock")
+
+
+def _docker_api_get(path, timeout=6):
+    """GET ke Docker Engine API lewat unix socket, tanpa dependency tambahan."""
+    import http.client
+    import socket as _socket
+
+    class _UnixHTTPConnection(http.client.HTTPConnection):
+        def __init__(self):
+            super().__init__("localhost", timeout=timeout)
+
+        def connect(self):
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(DOCKER_SOCK)
+            self.sock = sock
+
+    conn = _UnixHTTPConnection()
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return None
+        return json.loads(resp.read().decode())
+    finally:
+        conn.close()
+
+
+def _read_cpu_totals():
+    with open("/proc/stat") as fh:
+        parts = fh.readline().split()[1:]
+    values = [int(v) for v in parts]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return sum(values), idle
+
+
+def _host_stats():
+    total1, idle1 = _read_cpu_totals()
+    time.sleep(0.25)
+    total2, idle2 = _read_cpu_totals()
+    dt, di = total2 - total1, idle2 - idle1
+    cpu_percent = round((1 - di / dt) * 100, 1) if dt > 0 else None
+
+    meminfo = {}
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            key, _, rest = line.partition(":")
+            meminfo[key.strip()] = int(rest.strip().split()[0]) * 1024  # kB → bytes
+    mem_total = meminfo.get("MemTotal", 0)
+    mem_available = meminfo.get("MemAvailable", 0)
+
+    disk = shutil.disk_usage("/data")
+
+    return {
+        "cpu_percent": cpu_percent,
+        "cpu_count": os.cpu_count(),
+        "load_avg": list(os.getloadavg()),
+        "mem_total": mem_total,
+        "mem_used": mem_total - mem_available,
+        "disk_total": disk.total,
+        "disk_used": disk.used,
+    }
+
+
+def _container_stats(container):
+    cid = container.get("Id")
+    name = (container.get("Names") or ["?"])[0].lstrip("/")
+    entry = {
+        "name": name,
+        "image": container.get("Image"),
+        "state": container.get("State"),
+        "status": container.get("Status"),
+        "cpu_percent": None,
+        "mem_used": None,
+        "mem_limit": None,
+    }
+    if container.get("State") != "running":
+        return entry
+    try:
+        # Path tanpa prefix versi → Docker pakai versi API terbarunya sendiri
+        stats = _docker_api_get(f"/containers/{cid}/stats?stream=false")
+        if not stats:
+            return entry
+        cpu = stats.get("cpu_stats") or {}
+        precpu = stats.get("precpu_stats") or {}
+        cpu_delta = (cpu.get("cpu_usage") or {}).get("total_usage", 0) - \
+                    (precpu.get("cpu_usage") or {}).get("total_usage", 0)
+        sys_delta = cpu.get("system_cpu_usage", 0) - precpu.get("system_cpu_usage", 0)
+        online_cpus = cpu.get("online_cpus") or len((cpu.get("cpu_usage") or {}).get("percpu_usage") or []) or 1
+        if cpu_delta > 0 and sys_delta > 0:
+            entry["cpu_percent"] = round((cpu_delta / sys_delta) * online_cpus * 100, 1)
+        mem = stats.get("memory_stats") or {}
+        usage = mem.get("usage")
+        if usage is not None:
+            # Kurangi page cache supaya sesuai dengan angka `docker stats`
+            cache = (mem.get("stats") or {}).get("inactive_file", 0)
+            entry["mem_used"] = max(usage - cache, 0)
+            entry["mem_limit"] = mem.get("limit")
+    except Exception:
+        pass
+    return entry
+
+
+@app.route('/api/server-stats', methods=['GET'])
+def get_server_stats():
+    payload = {"ok": True, "host": None, "containers": [], "docker_available": False}
+    try:
+        payload["host"] = _host_stats()
+    except Exception as exc:
+        payload["host_error"] = str(exc)[:120]
+
+    if os.path.exists(DOCKER_SOCK):
+        try:
+            containers = _docker_api_get("/containers/json?all=true") or []
+            payload["docker_available"] = True
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                payload["containers"] = sorted(
+                    ex.map(_container_stats, containers),
+                    key=lambda c: (c["state"] != "running", c["name"]),
+                )
+        except Exception as exc:
+            payload["docker_error"] = str(exc)[:120]
+
+    return jsonify(payload)
 
 
 # ── Camera Snapshot ──────────────────────────────────────────────────────────
