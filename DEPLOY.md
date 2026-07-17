@@ -104,6 +104,11 @@ yang hilang.
 
 ## 7. Menghemat resource (server kecil)
 
+- **Matikan AI Detection** — toggle "🧠 AI Detection" di bagian atas halaman
+  Konfigurasi. Ini master switch: semua worker analyzer (YOLO + face
+  recognition, semua kamera) berhenti total, streaming CCTV tetap jalan
+  normal. Paling cepat dan paling besar dampaknya kalau butuh fokus ke
+  streaming saja tanpa ubah env/redeploy.
 - Kualitas stream **Substream** (lihat langkah 4.2) — pengaruh terbesar.
 - Di `.env`, analyzer bisa diringankan lalu `docker compose up -d analyzer`:
   ```env

@@ -132,10 +132,14 @@ const HLS_CONFIG = {
   enableWorker: true,
   lowLatencyMode: false,        // use standard HLS — LL tags stripped by loader above
   liveSyncDurationCount: 2,     // target ~2 segmen (±2 dtk) di belakang live edge
-  liveMaxLatencyDurationCount: 8,  // lebih jauh dari ini → seek ke live edge
+  // Diperketat dari 8→4: kalau satu tile lebih jauh dari ini di belakang live
+  // edge-nya sendiri (mis. abis stall/network blip), langsung snap balik
+  // alih-alih dibiarkan tertinggal lama — supaya antar tile tidak makin
+  // njomplang delay-nya satu sama lain saat ditonton bersamaan.
+  liveMaxLatencyDurationCount: 4,
   // Kejar ketinggalan dengan mempercepat playback alih-alih membiarkan delay
   // menumpuk permanen setelah buffering/stall.
-  maxLiveSyncPlaybackRate: 1.5,
+  maxLiveSyncPlaybackRate: 1.8,
   maxBufferLength: 12,
   maxBufferHole: 0.5,
   startLevel: -1,

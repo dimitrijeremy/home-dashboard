@@ -211,6 +211,24 @@ export async function postMode(mode) {
   return res.json()
 }
 
+// ── AI Global Toggle ──────────────────────────────────────────────────────────
+
+export async function fetchAiConfig() {
+  const res = await fetch(url('/api/ai-config'))
+  if (!res.ok) throw new Error('Failed to fetch AI config')
+  return res.json()   // { enabled: boolean }
+}
+
+export async function postAiConfig(enabled) {
+  const res = await fetch(url('/api/ai-config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+  if (!res.ok) throw new Error('Failed to set AI config')
+  return res.json()
+}
+
 // ── NVR Config ────────────────────────────────────────────────────────────────
 
 export async function fetchNvrConfig() {

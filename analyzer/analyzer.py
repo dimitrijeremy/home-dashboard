@@ -383,8 +383,37 @@ def channel_worker(camera_id: int, camera_name: str, channel_id: str,
 _workers: dict[str, dict] = {}
 
 
+_ai_globally_off_logged = False
+
+
+def _ai_globally_enabled() -> bool:
+    """Master switch — kalau OFF, semua worker berhenti apa pun status
+    ai_enabled per-kamera. Dipakai untuk fokus ke streaming saat server berat.
+    """
+    global _ai_globally_off_logged
+    try:
+        r = requests.get(f"{BACKEND_URL}/api/ai-config", timeout=5)
+        enabled = bool(r.json().get("enabled", True)) if r.status_code == 200 else True
+    except Exception as e:
+        log.warning(f"ai-config fetch error, assuming enabled: {e}")
+        enabled = True
+    if not enabled and not _ai_globally_off_logged:
+        log.info("AI globally OFF — stopping all detection workers")
+        _ai_globally_off_logged = True
+    elif enabled:
+        _ai_globally_off_logged = False
+    return enabled
+
+
 def sync_workers():
     """Start/stop worker threads to match AI-enabled cameras from backend."""
+    if not _ai_globally_enabled():
+        for ch in list(_workers.keys()):
+            _workers[ch]["stop"].set()
+            del _workers[ch]
+            log.info(f"Stopping worker for {ch} (AI globally off)")
+        return
+
     try:
         r = requests.get(f"{BACKEND_URL}/api/cameras", timeout=8)
         if r.status_code != 200:

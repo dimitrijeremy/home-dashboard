@@ -722,6 +722,7 @@ def init_db():
     """)
     # Seed default settings (env hanya jadi nilai awal; selanjutnya dikelola via UI)
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('mode', 'home')")
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_global_enabled', '1')")
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_host', ?)", (DVR_HOST,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_http_port', ?)", (str(DVR_HTTP_PORT),))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('builtin_channel_count', ?)", (os.getenv("NVR_CHANNELS", "4"),))
@@ -1725,6 +1726,26 @@ def update_mode():
     db.commit()
     print(f"[MODE] Changed to '{mode}'", flush=True)
     return jsonify({'mode': mode})
+
+
+# ── AI Global Toggle ─────────────────────────────────────────────────────────
+# Master switch terpisah dari toggle ai_enabled per-kamera: kalau ini OFF,
+# analyzer berhenti total (semua worker thread, apa pun status per-kamera) —
+# dipakai untuk fokus ke streaming saja saat server sedang berat.
+
+@app.route('/api/ai-config', methods=['GET'])
+def get_ai_config():
+    enabled = _db_setting('ai_global_enabled', '1') == '1'
+    return jsonify({'enabled': enabled})
+
+
+@app.route('/api/ai-config', methods=['POST'])
+def update_ai_config():
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get('enabled', True))
+    _set_db_setting('ai_global_enabled', '1' if enabled else '0')
+    print(f"[AI] Global toggle changed to {'ON' if enabled else 'OFF'}", flush=True)
+    return jsonify({'enabled': enabled})
 
 
 # ── Analyzer Events (intake + read) ──────────────────────────────────────────

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo } from '../services/api'
+import { fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo, fetchAiConfig, postAiConfig } from '../services/api'
 import ZoneEditor from '../features/detection/ZoneEditor'
 import FaceManager from '../features/detection/FaceManager'
 import EventHistory from '../features/detection/EventHistory'
@@ -30,6 +30,10 @@ export default function ConfigPage({ onBack }) {
   const [nvrInfo, setNvrInfo]     = useState(null)
   const [nvrInfoLoading, setNvrInfoLoading] = useState(false)
 
+  // AI global toggle (master switch — beda dari toggle ai_enabled per-kamera)
+  const [aiEnabled, setAiEnabled] = useState(true)
+  const [aiSaving,  setAiSaving]  = useState(false)
+
   const formatBytes = (value) => {
     if (!value) return '0 B'
     const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -49,7 +53,21 @@ export default function ConfigPage({ onBack }) {
         if (list.length > 0) setSelectedCam(list[0])
       })
       .catch(() => {})
+    fetchAiConfig().then(cfg => setAiEnabled(cfg.enabled)).catch(() => {})
   }, [])
+
+  async function handleAiToggle() {
+    const next = !aiEnabled
+    setAiSaving(true)
+    setAiEnabled(next)   // optimistic
+    try {
+      await postAiConfig(next)
+    } catch {
+      setAiEnabled(!next)   // revert on failure
+    } finally {
+      setAiSaving(false)
+    }
+  }
 
   useEffect(() => {
     if (tab === 'nvr') {
@@ -106,6 +124,28 @@ export default function ConfigPage({ onBack }) {
           <span>🛡</span> Konfigurasi AI Deteksi
         </div>
       </header>
+
+      <div className={`ai-master-toggle ${aiEnabled ? '' : 'off'}`}>
+        <div>
+          <div className="ai-master-toggle-title">
+            {aiEnabled ? '🧠 AI Detection: Aktif' : '📹 AI Detection: Nonaktif — fokus streaming'}
+          </div>
+          <div className="ai-master-toggle-hint">
+            {aiEnabled
+              ? 'Zona, wajah, dan riwayat deteksi berjalan normal. Matikan untuk hemat CPU/RAM kalau server sedang berat.'
+              : 'Semua deteksi AI (zona, wajah) berhenti total di semua kamera — streaming CCTV tetap jalan seperti biasa. Toggle AI per-kamera diabaikan sementara.'}
+          </div>
+        </div>
+        <button
+          type="button"
+          className={`ai-master-switch ${aiEnabled ? 'on' : ''}`}
+          onClick={handleAiToggle}
+          disabled={aiSaving}
+          aria-pressed={aiEnabled}
+        >
+          <span className="ai-master-switch-knob" />
+        </button>
+      </div>
 
       {/* Tabs */}
       <div className="config-tabs">
