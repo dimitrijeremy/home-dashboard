@@ -32,6 +32,7 @@ export default function AddChannelModal({ onAdd, onClose }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [channel, setChannel]   = useState('5')
+  const [nvrPtz,  setNvrPtz]    = useState(false)
   const [error,   setError]     = useState('')
   const [loading, setLoading]   = useState(false)
   const submitting = useRef(false)
@@ -85,7 +86,7 @@ export default function AddChannelModal({ onAdd, onClose }) {
       if (!/^\d+$/.test(chRaw) || Number(chRaw) <= 0) { setError('Channel harus angka lebih dari 0'); return }
       address = rtsp
       ch = Number(chRaw)
-      ptzSupported = false
+      ptzSupported = nvrPtz
     }
 
     submitting.current = true
@@ -178,6 +179,16 @@ export default function AddChannelModal({ onAdd, onClose }) {
               value={channel}
               onChange={e => { setChannel(e.target.value); setError('') }}
             />
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={nvrPtz}
+                onChange={e => setNvrPtz(e.target.checked)}
+                style={{ width: 'auto' }}
+              />
+              Channel ini kamera PTZ (speed dome lewat NVR)
+            </label>
           </>
         )}
 
@@ -185,7 +196,12 @@ export default function AddChannelModal({ onAdd, onClose }) {
           {camType === 'ipptz' ? (
             <>Cukup isi IP kamera — kamera IP PTZ hanya punya 1 channel, jadi
             nomor channel tidak perlu. Kontrol PTZ otomatis aktif dan perintah
-            pan/tilt/zoom dikirim langsung ke IP kamera.</>
+            pan/tilt/zoom dikirim langsung ke IP kamera. <b>Pilih ini hanya
+            kalau kamera punya IP sendiri yang bisa diakses langsung dari
+            server</b> (bukan speed dome yang nyambung lewat port PoE
+            internal NVR) — kalau tidak, video &amp; PTZ akan gagal connect.
+            Untuk speed dome yang tersambung lewat NVR, pakai tab
+            "Channel NVR" dan centang "kamera PTZ" di bawah.</>
           ) : (
             <>Isi alamat RTSP dasar tanpa username, password, dan tanpa `channel=`.
             Kamu juga bisa pakai placeholder <code style={{ color: 'var(--accent)' }}>{'{channel}'}</code>.
