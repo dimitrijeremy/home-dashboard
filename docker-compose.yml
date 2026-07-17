@@ -1,5 +1,13 @@
 services:
 
+  # ── Resource limits (cpus/mem_limit) ──────────────────────────────────────
+  # Tanpa batasan, satu container yang spike (ffmpeg transcode atau AI
+  # analyzer) bisa menghabiskan seluruh CPU host dan bikin SEMUA service
+  # (termasuk dashboard-nya sendiri) ikut freeze, bukan cuma stream yang berat.
+  # Nilai di bawah ini titik awal yang aman untuk mini PC/NUC 4 core — cek
+  # `nproc` dan `free -h` di server, lalu sesuaikan. `docker stats` saat
+  # sistem terasa berat akan menunjukkan container mana yang jadi biang CPU.
+
   # ── MediaMTX: media server (RTSP in, HLS out) ─────────────────────────────
   # Di Mac lokal: TIDAK dijalankan di sini, jalankan binary mediamtx di host:
   #   ./mediamtx mediamtx.yml
@@ -10,6 +18,8 @@ services:
   # menu konfigurasi dashboard (tersimpan di database).
   mtx:
     build: ./mtx
+    cpus: 3.0
+    mem_limit: 1536m
     volumes:
       - ./mtx/mediamtx.yml:/app/mediamtx.yml:ro
       - ./mtx/start_stream.sh:/app/start_stream.sh:ro
@@ -25,6 +35,8 @@ services:
 
   backend:
     build: ./backend
+    cpus: 1.5
+    mem_limit: 768m
     ports:
       - "5001:5000"   # opsional, untuk debug langsung ke API
     environment:
@@ -63,6 +75,8 @@ services:
 
   analyzer:
     build: ./analyzer
+    cpus: 3.0
+    mem_limit: 2g
     environment:
       - BACKEND_URL=http://backend:5000
       - MTX_RTSP=rtsp://mtx:8554
@@ -85,6 +99,8 @@ services:
 
   frontend:
     build: ./frontend
+    cpus: 0.5
+    mem_limit: 256m
     ports:
       # Ganti 8088 ke port yang tersedia di server (80 dan 443 biasanya sudah terpakai).
       # Akses dashboard: http://<server-ip>:8088
