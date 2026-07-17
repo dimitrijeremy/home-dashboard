@@ -78,26 +78,53 @@ fi
 
 SOURCE_URL="rtsps://${DVR_USER_VAL}:${DVR_PASS_VAL}@${DVR_HOST_VAL}:554/cam/realmonitor?channel=${CH}&subtype=${STREAM_SUBTYPE}&unicast=true&proto=Onvif&tls=true"
 
+# HWACCEL=vaapi (opsional, set di .env): pakai Intel Quick Sync untuk encode
+# H.264 (decode tetap software — cukup ringan, yang mahal itu encode-nya).
+# Default kosong = software libx264 seperti semula, tidak ada perubahan
+# perilaku kalau HWACCEL tidak di-set. Syarat: /dev/dri di-passthrough ke
+# container (docker-compose `devices:`) dan node punya iGPU Intel yang aktif
+# — verifikasi dulu dengan `vainfo` di dalam container sebelum mengandalkan ini.
+VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
+
 # CATATAN: jangan tambahkan -tls_verify di sini — ffmpeg 4.4 (Ubuntu 22.04)
 # tidak mengenal opsi itu untuk input RTSP dan akan exit dengan
 # "Option tls_verify not found" justru SETELAH koneksi berhasil.
 # Verifikasi sertifikat TLS ffmpeg memang sudah off secara default.
-exec ffmpeg \
-  -hide_banner -loglevel warning \
-  -rtsp_transport tcp \
-  -i "$SOURCE_URL" \
-  $SCALE_ARGS \
-  -c:v libx264 \
-  -preset ultrafast \
-  -tune zerolatency \
-  -pix_fmt yuv420p \
-  -g 25 \
-  -keyint_min 25 \
-  -force_key_frames 'expr:gte(t,n_forced*1)' \
-  -sc_threshold 0 \
-  -b:v "$VIDEO_BITRATE" \
-  -maxrate "$MAXRATE_VALUE" \
-  -bufsize "$BUFSIZE_VALUE" \
-  -c:a aac -b:a 64k \
-  -rtsp_transport tcp \
-  -f rtsp "rtsp://localhost:8554/ch${CH}"
+if [ "${HWACCEL:-}" = "vaapi" ]; then
+  exec ffmpeg \
+    -hide_banner -loglevel warning \
+    -vaapi_device "$VAAPI_DEVICE" \
+    -rtsp_transport tcp \
+    -i "$SOURCE_URL" \
+    -vf "${SCALE_ARGS:+${SCALE_ARGS#-vf },}format=nv12,hwupload" \
+    -c:v h264_vaapi \
+    -g 25 \
+    -keyint_min 25 \
+    -bf 0 \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$MAXRATE_VALUE" \
+    -bufsize "$BUFSIZE_VALUE" \
+    -c:a aac -b:a 64k \
+    -rtsp_transport tcp \
+    -f rtsp "rtsp://localhost:8554/ch${CH}"
+else
+  exec ffmpeg \
+    -hide_banner -loglevel warning \
+    -rtsp_transport tcp \
+    -i "$SOURCE_URL" \
+    $SCALE_ARGS \
+    -c:v libx264 \
+    -preset ultrafast \
+    -tune zerolatency \
+    -pix_fmt yuv420p \
+    -g 25 \
+    -keyint_min 25 \
+    -force_key_frames 'expr:gte(t,n_forced*1)' \
+    -sc_threshold 0 \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$MAXRATE_VALUE" \
+    -bufsize "$BUFSIZE_VALUE" \
+    -c:a aac -b:a 64k \
+    -rtsp_transport tcp \
+    -f rtsp "rtsp://localhost:8554/ch${CH}"
+fi

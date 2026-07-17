@@ -20,6 +20,18 @@ services:
     build: ./mtx
     cpus: 3.0
     mem_limit: 1536m
+    # Hardware encode (Intel Quick Sync/VAAPI) — OFF by default, aman untuk
+    # semua server. Untuk aktifkan (butuh NUC/PC dengan iGPU Intel):
+    #   1. Cek dulu di server: ls /dev/dri   → harus ada card0 + renderD128.
+    #      Kalau tidak ada, JANGAN uncomment baris `devices:` di bawah —
+    #      compose akan gagal start service ini sama sekali.
+    #   2. Uncomment 2 baris `devices:` di service ini DAN service `backend`.
+    #   3. Set HWACCEL=vaapi di .env server.
+    #   4. docker compose up -d --build, lalu cek log: `docker compose logs mtx`
+    #      — kalau ffmpeg error soal vaapi/renderD128, set HWACCEL kosong lagi
+    #      untuk rollback instan ke software encode (tanpa perlu revert compose).
+    # devices:
+    #   - /dev/dri:/dev/dri
     volumes:
       - ./mtx/mediamtx.yml:/app/mediamtx.yml:ro
       - ./mtx/start_stream.sh:/app/start_stream.sh:ro
@@ -29,6 +41,8 @@ services:
       - DVR_HOST=${DVR_HOST:-}
       - DVR_USER=${DVR_USER:-}
       - DVR_PASS=${DVR_PASS:-}
+      - HWACCEL=${HWACCEL:-}
+      - VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
     networks:
       - hd-net
     restart: unless-stopped
@@ -37,6 +51,10 @@ services:
     build: ./backend
     cpus: 1.5
     mem_limit: 768m
+    # Hardware encode (custom stream channel) — lihat catatan lengkap di
+    # service `mtx` di atas. Uncomment bareng dengan devices: di `mtx`.
+    # devices:
+    #   - /dev/dri:/dev/dri
     ports:
       - "5001:5000"   # opsional, untuk debug langsung ke API
     environment:
@@ -65,6 +83,8 @@ services:
       # push stream custom ke mediamtx container via jaringan internal Docker.
       - MTX_HOST=mtx
       - RTSP_PORT=8554
+      - HWACCEL=${HWACCEL:-}
+      - VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
     volumes:
       - camera_data:/data
       # Docker socket (read-only) untuk panel resource server di dashboard

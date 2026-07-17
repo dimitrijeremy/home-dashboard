@@ -16,10 +16,10 @@ dipanggil sendiri oleh mediamtx saat ada viewer (on-demand).
 ## 2. Ambil kode & konfigurasi
 
 ```bash
-git clone <url-repo> home-dashboard
+git clone <https://github.com/dimitrijeremy/home-dashboard> home-dashboard
 cd home-dashboard
 cp .env.example .env
-nano .env
+s
 ```
 
 Isi `.env` minimal:
@@ -113,6 +113,30 @@ yang hilang.
   ```
 - Matikan AI per kamera dari modal edit kamera (toggle AI) — worker analyzer
   untuk kamera itu berhenti otomatis ≤ 60 detik.
+- `docker-compose.yml` sudah membatasi CPU/RAM per service (`cpus`/`mem_limit`)
+  supaya satu container yang spike tidak ikut membekukan seluruh host. Kalau
+  server-nya lebih kecil/besar dari NUC 4-core, sesuaikan nilainya.
+
+## 7b. Hardware encode (Intel Quick Sync / VAAPI) — opsional
+
+Semua transcode default pakai `libx264` software encode — paling berat di
+CPU. Kalau server punya iGPU Intel (NUC/mini PC modern), encode bisa
+dialihkan ke GPU (jauh lebih ringan di CPU):
+
+1. Cek dulu device-nya ada: `ls /dev/dri` di server — harus muncul `card0`
+   dan `renderD128`. Kalau tidak ada (mis. jalan di VM tanpa GPU passthrough),
+   **jangan lanjut** — langkah 2 akan bikin service gagal start.
+2. Di `docker-compose.yml`, uncomment 2 baris `devices: - /dev/dri:/dev/dri`
+   di service `mtx` dan `backend`.
+3. Tambahkan di `.env`:
+   ```env
+   HWACCEL=vaapi
+   ```
+4. `docker compose up -d --build`, lalu cek `docker compose logs mtx` dan
+   `docker compose logs backend` — kalau ada error terkait `vaapi`/
+   `renderD128`, biasanya driver iGPU tidak cocok/tidak aktif.
+5. Rollback instan tanpa revert compose: kosongkan `HWACCEL=` di `.env` lalu
+   `docker compose up -d` — otomatis balik ke software encode.
 
 ## 8. Troubleshooting cepat
 
@@ -124,3 +148,4 @@ yang hilang.
 | Akun Dahua terkunci (403 RmLock) | Tunggu sesuai detik RmLock; jangan spam restart |
 | Delay membesar | Cek CPU di panel Server — kalau jenuh, turunkan kualitas stream |
 | ch1 selalu offline | Normal — channel 1 NVR memang tidak ada kameranya |
+| Error `vaapi`/`renderD128` setelah aktifkan HWACCEL | Kosongkan `HWACCEL=` di `.env`, `docker compose up -d` — rollback ke software encode |

@@ -6,8 +6,18 @@ ENV PYTHONUNBUFFERED=1
 # ffmpeg diperlukan untuk launch custom RTSP stream ke mediamtx
 # socat: TLS bridge untuk kamera yang mewajibkan RTSPS tapi menolak request-line
 # berskema rtsps:// dari ffmpeg (mis. Dahua DH-P5AE-PV)
+# intel-media-va-driver-non-free (iHD, VAAPI/Quick Sync): best-effort saja.
+# Base image ini (Debian slim) tidak mengaktifkan komponen "non-free" secara
+# default, jadi paket ini kemungkinan besar tidak akan ketemu di sini — install
+# di-skip diam-diam (|| true) supaya build backend TIDAK PERNAH gagal gara-gara
+# ini. Kalau HWACCEL=vaapi butuh jalan juga untuk custom channel (bukan cuma
+# channel NVR lewat mtx), aktifkan komponen non-free di sources Debian dulu.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg socat && \
+    apt-get install -y --no-install-recommends ffmpeg socat vainfo && \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      apt-get install -y --no-install-recommends intel-media-va-driver-non-free || \
+        echo "[build] intel-media-va-driver-non-free tidak tersedia — HWACCEL=vaapi tidak akan jalan di container ini" >&2; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

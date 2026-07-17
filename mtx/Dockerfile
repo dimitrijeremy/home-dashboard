@@ -2,8 +2,16 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# intel-media-va-driver-non-free (iHD, VAAPI/Quick Sync) — repo multiverse,
+# amd64 saja. Install best-effort (|| true): kalau paketnya tidak ketemu untuk
+# alasan apa pun, build TETAP lanjut, hanya HWACCEL=vaapi yang tidak akan
+# jalan di container ini (software encode default tidak terpengaruh).
 RUN apt-get update && \
-  apt-get install -y --no-install-recommends ffmpeg ca-certificates curl python3 && \
+  apt-get install -y --no-install-recommends ffmpeg ca-certificates curl python3 vainfo && \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      apt-get install -y --no-install-recommends intel-media-va-driver-non-free || \
+        echo "[build] intel-media-va-driver-non-free tidak tersedia — HWACCEL=vaapi tidak akan jalan di container ini" >&2; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
 # Download mediamtx binary — deteksi otomatis arsitektur container (amd64 / arm64)

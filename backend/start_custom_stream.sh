@@ -101,31 +101,59 @@ ensure_bridge() {
   sleep 1
 }
 
+# HWACCEL=vaapi (opsional, set di .env): sama seperti mtx/start_stream.sh —
+# lihat komentar di sana untuk syarat & catatan. Default kosong = software
+# libx264 seperti semula.
+VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
+
 while :; do
   ensure_bridge
-  ffmpeg \
-    -hide_banner -loglevel warning \
-    -fflags +genpts+discardcorrupt \
-    -use_wallclock_as_timestamps 1 \
-    -rtsp_transport tcp \
-    -i "$SOURCE_URL" \
-    -map 0:v:0 \
-    -dn \
-    -an \
-    $SCALE_ARGS \
-    -c:v libx264 \
-    -preset ultrafast \
-    -tune zerolatency \
-    -pix_fmt yuv420p \
-    -g 25 \
-    -keyint_min 25 \
-    -force_key_frames 'expr:gte(t,n_forced*1)' \
-    -sc_threshold 0 \
-    -b:v "$VIDEO_BITRATE" \
-    -maxrate "$MAXRATE_VALUE" \
-    -bufsize "$BUFSIZE_VALUE" \
-    -rtsp_transport tcp \
-    -f rtsp "rtsp://${MTX_HOST_VALUE}:${RTSP_PORT_VALUE}/${PATH_NAME}" &
+  if [ "${HWACCEL:-}" = "vaapi" ]; then
+    ffmpeg \
+      -hide_banner -loglevel warning \
+      -fflags +genpts+discardcorrupt \
+      -use_wallclock_as_timestamps 1 \
+      -vaapi_device "$VAAPI_DEVICE" \
+      -rtsp_transport tcp \
+      -i "$SOURCE_URL" \
+      -map 0:v:0 \
+      -dn \
+      -an \
+      -vf "${SCALE_ARGS:+${SCALE_ARGS#-vf },}format=nv12,hwupload" \
+      -c:v h264_vaapi \
+      -g 25 \
+      -keyint_min 25 \
+      -bf 0 \
+      -b:v "$VIDEO_BITRATE" \
+      -maxrate "$MAXRATE_VALUE" \
+      -bufsize "$BUFSIZE_VALUE" \
+      -rtsp_transport tcp \
+      -f rtsp "rtsp://${MTX_HOST_VALUE}:${RTSP_PORT_VALUE}/${PATH_NAME}" &
+  else
+    ffmpeg \
+      -hide_banner -loglevel warning \
+      -fflags +genpts+discardcorrupt \
+      -use_wallclock_as_timestamps 1 \
+      -rtsp_transport tcp \
+      -i "$SOURCE_URL" \
+      -map 0:v:0 \
+      -dn \
+      -an \
+      $SCALE_ARGS \
+      -c:v libx264 \
+      -preset ultrafast \
+      -tune zerolatency \
+      -pix_fmt yuv420p \
+      -g 25 \
+      -keyint_min 25 \
+      -force_key_frames 'expr:gte(t,n_forced*1)' \
+      -sc_threshold 0 \
+      -b:v "$VIDEO_BITRATE" \
+      -maxrate "$MAXRATE_VALUE" \
+      -bufsize "$BUFSIZE_VALUE" \
+      -rtsp_transport tcp \
+      -f rtsp "rtsp://${MTX_HOST_VALUE}:${RTSP_PORT_VALUE}/${PATH_NAME}" &
+  fi
   ffmpeg_pid=$!
 
   set +e
