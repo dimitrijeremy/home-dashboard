@@ -15,6 +15,13 @@ MTX_HOST_VALUE=${MTX_HOST:-localhost}
 VIDEO_BITRATE=${CUSTOM_STREAM_VIDEO_BITRATE:-3000k}
 MAXRATE_VALUE=${CUSTOM_STREAM_MAXRATE:-3500k}
 BUFSIZE_VALUE=${CUSTOM_STREAM_BUFSIZE:-7000k}
+# Sebagian kamera (mis. substream H.265 dengan timing tidak beraturan / variable
+# framerate) bikin encoder x264 di bawah terus-menerus "VBV underflow" karena
+# GOP/bitrate-nya dihitung berbasis asumsi frame rate konstan, sementara
+# -use_wallclock_as_timestamps di bawah membuat jarak antar-frame tidak rata.
+# Paksa frame rate output konstan di sini supaya x264 selalu punya basis
+# timing yang stabil, apa pun keteraturan sumbernya.
+FPS_VALUE=${CUSTOM_STREAM_FPS:-15}
 
 # STREAM_QUALITY (env dari backend, setting 'stream_quality' di dashboard):
 #   source (default) — tanpa scale; 720/480 — scale turun + bitrate lebih rendah;
@@ -119,7 +126,7 @@ while :; do
       -map 0:v:0 \
       -dn \
       -an \
-      -vf "${SCALE_ARGS:+${SCALE_ARGS#-vf },}format=nv12,hwupload" \
+      -vf "${SCALE_ARGS:+${SCALE_ARGS#-vf },}fps=${FPS_VALUE},format=nv12,hwupload" \
       -c:v h264_vaapi \
       -g 25 \
       -keyint_min 25 \
@@ -139,7 +146,7 @@ while :; do
       -map 0:v:0 \
       -dn \
       -an \
-      $SCALE_ARGS \
+      -vf "${SCALE_ARGS:+${SCALE_ARGS#-vf },}fps=${FPS_VALUE}" \
       -c:v libx264 \
       -preset ultrafast \
       -tune zerolatency \

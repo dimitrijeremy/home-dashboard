@@ -149,6 +149,7 @@ dialihkan ke GPU (jauh lebih ringan di CPU):
 |---|---|
 | Channel built-in hitam | `docker logs home-dashboard-mtx-1` — error ffmpeg persis ada di sini |
 | Kamera custom hitam | `docker exec home-dashboard-backend-1 cat /tmp/custom_<id>.log` |
+| Kamera custom "online" tapi loading terus, log penuh `VBV underflow` | Substream kamera itu kemungkinan H.265 dengan frame rate tidak beraturan — sudah ditangani otomatis (`start_custom_stream.sh` memaksa `fps=15` sebelum encode). Kalau masih muncul, cek `ffprobe` langsung ke sumbernya untuk pastikan codec/resolusi |
 | Kredensial NVR | Dikelola di DB (menu Konfigurasi), **bukan** .env setelah seed pertama |
 | Akun Dahua terkunci (403 RmLock) | Tunggu sesuai detik RmLock; jangan spam restart |
 | Delay membesar | Cek CPU di panel Server — kalau jenuh, turunkan kualitas stream |
