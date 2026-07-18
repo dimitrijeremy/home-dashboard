@@ -31,10 +31,13 @@ START_DELAY=${STREAM_START_DELAY:-5}
 
 # Ambil host + credentials dari backend config API (menu konfigurasi dashboard)
 NVR_CONFIG_URL=${NVR_CONFIG_URL:-http://backend:5000/api/nvr-config}
+# /api/* sekarang butuh login browser ATAU token internal ini (server-to-server,
+# dibaca dari file di volume /data yang sama-sama di-mount dengan backend).
+INTERNAL_TOKEN=$(cat /data/.internal_token 2>/dev/null || true)
 
 sleep "$START_DELAY"
 
-CONFIG_JSON=$(curl -fsS --max-time 5 "$NVR_CONFIG_URL" 2>/dev/null || true)
+CONFIG_JSON=$(curl -fsS --max-time 5 -H "X-Internal-Token: ${INTERNAL_TOKEN}" "$NVR_CONFIG_URL" 2>/dev/null || true)
 if [ -n "$CONFIG_JSON" ]; then
   H=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("host") or "")' 2>/dev/null || true)
   U=$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stream_user") or "")' 2>/dev/null || true)

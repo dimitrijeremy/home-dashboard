@@ -166,6 +166,9 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .modal-hint{font-size:.72rem;color:var(--text-muted);margin-top:4px}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
 
+.login-page{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);padding:20px}
+.login-card{width:100%;max-width:360px}
+
 /* ── Animations ── */
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 @keyframes spin{to{transform:rotate(360deg)}}

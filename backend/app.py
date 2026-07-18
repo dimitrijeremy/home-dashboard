@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -14,16 +15,17 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 import requests
 from requests.auth import HTTPDigestAuth
-from flask import Flask, Response, jsonify, request, g, send_file, stream_with_context
+from werkzeug.security import check_password_hash, generate_password_hash
+from flask import Flask, Response, jsonify, request, g, send_file, session, stream_with_context
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8888")
@@ -117,6 +119,70 @@ DVR_PASS      = os.getenv("DVR_PASS", "")
 # Falls back to DVR_USER/DVR_PASS if not configured.
 DVR_EVENT_USER = os.getenv("DVR_EVENT_USER") or DVR_USER
 DVR_EVENT_PASS = os.getenv("DVR_EVENT_PASS") or DVR_PASS
+
+# ── Auth ──────────────────────────────────────────────────────
+# ADMIN_USER/ADMIN_PASS: seed satu kali untuk user pertama saat tabel users
+# masih kosong (mis. baru deploy) — sesudahnya user dikelola dari menu
+# Konfigurasi > Users, bukan dari env lagi. GANTI password default ini
+# segera setelah login pertama.
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
+
+
+def _get_or_create_secret_file(path, nbytes=32):
+    """Baca token persisten dari file di /data (shared volume); generate acak
+    kalau belum ada. Dipakai untuk Flask session secret key dan token internal
+    antar-container — sengaja file-based (bukan DB) supaya tersedia sebelum
+    tabel settings ada, dan bisa dibaca container lain yang mount volume sama."""
+    try:
+        with open(path, 'r') as f:
+            existing = f.read().strip()
+            if existing:
+                return existing
+    except FileNotFoundError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    token = secrets.token_hex(nbytes)
+    with open(path, 'w') as f:
+        f.write(token)
+    os.chmod(path, 0o600)
+    return token
+
+
+_DATA_DIR = os.path.dirname(DB_PATH)
+os.makedirs(_DATA_DIR, exist_ok=True)
+app.secret_key = _get_or_create_secret_file(os.path.join(_DATA_DIR, '.flask_secret'))
+# Dipakai mtx/analyzer (server-to-server, tanpa sesi browser) supaya tetap bisa
+# mengakses /api/* internal tanpa lolos lewat halaman login.
+INTERNAL_API_TOKEN = _get_or_create_secret_file(os.path.join(_DATA_DIR, '.internal_token'))
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    # True hanya kalau di depan reverse proxy HTTPS — default LAN pakai HTTP polos.
+    SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '').strip().lower() == 'true',
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=SESSION_TIMEOUT_MINUTES),
+    SESSION_REFRESH_EACH_REQUEST=True,
+)
+
+# Endpoint yang boleh diakses tanpa sesi login (nama fungsi view, bukan path).
+_PUBLIC_API_ENDPOINTS = {'login_route', 'session_status'}
+
+
+@app.before_request
+def _require_auth():
+    if not request.path.startswith('/api/'):
+        return None
+    if request.endpoint in _PUBLIC_API_ENDPOINTS:
+        return None
+    # Server-to-server (mtx/analyzer) — bukan browser, tidak punya sesi.
+    if secrets.compare_digest(request.headers.get('X-Internal-Token', ''), INTERNAL_API_TOKEN):
+        return None
+    if session.get('user_id'):
+        session.permanent = True
+        return None
+    return jsonify({'error': 'unauthorized'}), 401
 
 _nvr_events = collections.deque(maxlen=30)
 _nvr_status = {"connected": False, "error": None, "last_event": None}
@@ -720,6 +786,33 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at    TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS login_log (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts       TEXT    NOT NULL,
+            username TEXT    NOT NULL,
+            success  INTEGER NOT NULL,
+            ip       TEXT
+        )
+    """)
+    if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        con.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)",
+            (ADMIN_USER, generate_password_hash(ADMIN_PASS), datetime.utcnow().isoformat()),
+        )
+        print(
+            f"[AUTH] Seeded default user '{ADMIN_USER}' — GANTI PASSWORD SEGERA "
+            f"lewat menu Konfigurasi > Users.",
+            flush=True,
+        )
     # Seed default settings (env hanya jadi nilai awal; selanjutnya dikelola via UI)
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('mode', 'home')")
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_global_enabled', '1')")
@@ -736,6 +829,110 @@ def init_db():
     con.commit()
     restore_custom_streams(con)
     con.close()
+
+# ── Auth Routes ───────────────────────────────────────────────
+# Satu tingkat akses saja (tidak ada admin vs user biasa) — cocok untuk
+# dashboard rumah dengan sedikit akun keluarga, bukan multi-tenant.
+
+def _client_ip():
+    return request.headers.get('X-Real-IP') or request.remote_addr or ''
+
+
+@app.route('/api/login', methods=['POST'])
+def login_route():
+    body = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip()
+    password = body.get('password') or ''
+
+    db = get_db()
+    row = db.execute(
+        "SELECT id, username, password_hash FROM users WHERE username=?", (username,)
+    ).fetchone()
+    ok = bool(row) and check_password_hash(row['password_hash'], password)
+
+    db.execute(
+        "INSERT INTO login_log (ts, username, success, ip) VALUES (?,?,?,?)",
+        (datetime.utcnow().isoformat(), username or '(kosong)', 1 if ok else 0, _client_ip()),
+    )
+    db.commit()
+
+    if not ok:
+        return jsonify({'error': 'Username atau password salah'}), 401
+
+    session.clear()
+    session['user_id'] = row['id']
+    session['username'] = row['username']
+    session.permanent = True
+    return jsonify({'username': row['username']})
+
+
+@app.route('/api/logout', methods=['POST'])
+def logout_route():
+    session.clear()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/session', methods=['GET'])
+def session_status():
+    if session.get('user_id'):
+        session.permanent = True
+        return jsonify({'authenticated': True, 'username': session.get('username')})
+    return jsonify({'authenticated': False})
+
+
+@app.route('/api/users', methods=['GET'])
+def list_users():
+    rows = get_db().execute(
+        "SELECT id, username, created_at FROM users ORDER BY id"
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/users', methods=['POST'])
+def create_user():
+    body = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip()
+    password = body.get('password') or ''
+    if not username:
+        return jsonify({'error': 'Username tidak boleh kosong'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Password minimal 6 karakter'}), 400
+
+    db = get_db()
+    if db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone():
+        return jsonify({'error': 'Username sudah dipakai'}), 400
+    cur = db.execute(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)",
+        (username, generate_password_hash(password), datetime.utcnow().isoformat()),
+    )
+    db.commit()
+    return jsonify({'id': cur.lastrowid, 'username': username}), 201
+
+
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+def delete_user(user_id):
+    db = get_db()
+    remaining = db.execute("SELECT COUNT(*) c FROM users").fetchone()['c']
+    if remaining <= 1:
+        return jsonify({'error': 'Tidak bisa hapus satu-satunya user yang tersisa'}), 400
+    if session.get('user_id') == user_id:
+        return jsonify({'error': 'Tidak bisa hapus akun yang sedang login'}), 400
+    db.execute("DELETE FROM users WHERE id=?", (user_id,))
+    db.commit()
+    return '', 204
+
+
+@app.route('/api/login-log', methods=['GET'])
+def get_login_log():
+    try:
+        limit = min(int(request.args.get('limit', 100)), 500)
+    except (TypeError, ValueError):
+        limit = 100
+    rows = get_db().execute(
+        "SELECT id, ts, username, success, ip FROM login_log ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
 
 # ── Routes ──────────────────────────────────────────────────
 

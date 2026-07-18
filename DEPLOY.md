@@ -45,11 +45,39 @@ docker compose up -d --build
 ```
 
 Build pertama memakan waktu (image analyzer ~3 GB berisi PyTorch/YOLO).
-Semua service punya `restart: unless-stopped` — otomatis hidup lagi setelah
-server reboot.
+Semua service punya `restart: unless-stopped` — otomatis hidup lagi kalau
+container-nya crash atau di-restart, **tapi ini cuma jalan kalau Docker
+daemon-nya sendiri sudah nyala**. Setelah reboot fisik server, pastikan Docker
+di-enable di systemd supaya ikut nyala otomatis saat boot (sekali saja):
+```bash
+sudo systemctl enable docker
+```
+Kalau lupa langkah ini, semua container (dan kamera) akan terlihat hilang
+total setelah server reboot sampai kamu jalankan `docker compose up -d` manual.
 
 Akses dashboard: `http://<ip-server>:8088`
 (port bisa diganti di `docker-compose.yml` bagian `frontend.ports`).
+
+## 3b. Login pertama
+
+Dashboard sekarang butuh login. User pertama di-seed otomatis dari `.env`
+(`ADMIN_USER`/`ADMIN_PASS`, default `admin`/`admin123` kalau tidak diisi) —
+**ganti password ini lewat menu Konfigurasi > Users segera setelah login
+pertama**. Sesi otomatis logout setelah idle 10 menit (`SESSION_TIMEOUT_MINUTES`
+di `.env`). Tambah/hapus user lain juga dari tab yang sama; riwayat semua
+percobaan login (berhasil/gagal, IP) ada di tab yang sama juga.
+
+Kalau kelupaan password dan tidak ada user lain yang bisa login, reset lewat
+database langsung di server:
+```bash
+docker exec home-dashboard-backend-1 python3 -c "
+from werkzeug.security import generate_password_hash
+import sqlite3
+c = sqlite3.connect('/data/cameras.db')
+c.execute(\"UPDATE users SET password_hash=? WHERE username='admin'\", (generate_password_hash('password-baru'),))
+c.commit()
+"
+```
 
 ## 4. Konfigurasi awal dari dashboard
 
@@ -150,6 +178,8 @@ dialihkan ke GPU (jauh lebih ringan di CPU):
 | Channel built-in hitam | `docker logs home-dashboard-mtx-1` — error ffmpeg persis ada di sini |
 | Kamera custom hitam | `docker exec home-dashboard-backend-1 cat /tmp/custom_<id>.log` |
 | Kamera custom "online" tapi loading terus, log penuh `VBV underflow` | Substream kamera itu kemungkinan H.265 dengan frame rate tidak beraturan — sudah ditangani otomatis (`start_custom_stream.sh` memaksa `fps=15` sebelum encode). Kalau masih muncul, cek `ffprobe` langsung ke sumbernya untuk pastikan codec/resolusi |
+| Semua channel NVR/custom mendadak gagal load bareng setelah update | Cek `docker logs home-dashboard-mtx-1` / `-analyzer-1` untuk error `401`/`unauthorized` — biasanya file `/data/.internal_token` belum ke-generate (backend belum sempat start duluan). `docker compose restart mtx analyzer` setelah backend jalan |
+| Lupa password, tidak ada user lain | Lihat § 3b — reset password admin langsung lewat `docker exec` ke DB |
 | Kredensial NVR | Dikelola di DB (menu Konfigurasi), **bukan** .env setelah seed pertama |
 | Akun Dahua terkunci (403 RmLock) | Tunggu sesuai detik RmLock; jangan spam restart |
 | Delay membesar | Cek CPU di panel Server — kalau jenuh, turunkan kualitas stream |

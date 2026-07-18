@@ -4,14 +4,29 @@ function url(path) {
   return BACKEND ? `${BACKEND}${path}` : path
 }
 
+// ── Auth-aware fetch ──────────────────────────────────────────────────────────
+// Semua request API lewat sini: selalu kirim cookie sesi (credentials), dan
+// beri tahu App kalau sesi sudah expired (401) supaya bisa redirect ke login
+// tanpa tiap pemanggil harus cek sendiri.
+let onUnauthorized = null
+export function setUnauthorizedHandler(fn) { onUnauthorized = fn }
+
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(url(path), { ...opts, credentials: 'include' })
+  if (res.status === 401 && path !== '/api/login' && path !== '/api/session') {
+    onUnauthorized?.()
+  }
+  return res
+}
+
 export async function fetchCameras() {
-  const res = await fetch(url('/api/cameras'))
+  const res = await apiFetch('/api/cameras')
   if (!res.ok) throw new Error('Failed to fetch cameras')
   return res.json()
 }
 
 export async function addCamera(name, rtsp_url, channel, ptz_supported = false) {
-  const res = await fetch(url('/api/cameras'), {
+  const res = await apiFetch('/api/cameras', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, rtsp_url, channel, ptz_supported }),
@@ -24,7 +39,7 @@ export async function addCamera(name, rtsp_url, channel, ptz_supported = false) 
 }
 
 export async function updateCamera(id, body) {
-  const res = await fetch(url(`/api/cameras/${id}`), {
+  const res = await apiFetch(`/api/cameras/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -37,7 +52,7 @@ export async function updateCamera(id, body) {
 }
 
 export async function ptzCommand(id, action, code, speed = 4) {
-  const res = await fetch(url(`/api/cameras/${id}/ptz`), {
+  const res = await apiFetch(`/api/cameras/${id}/ptz`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, code, speed }),
@@ -50,7 +65,7 @@ export async function ptzCommand(id, action, code, speed = 4) {
 }
 
 export async function reorderCameras(order) {
-  const res = await fetch(url('/api/cameras/reorder'), {
+  const res = await apiFetch('/api/cameras/reorder', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ order }),
@@ -63,13 +78,13 @@ export async function reorderCameras(order) {
 }
 
 export async function fetchServerStats() {
-  const res = await fetch(url('/api/server-stats'))
+  const res = await apiFetch('/api/server-stats')
   if (!res.ok) throw new Error('Failed to fetch server stats')
   return res.json()
 }
 
 export async function deleteCamera(id) {
-  const res = await fetch(url(`/api/cameras/${id}`), { method: 'DELETE' })
+  const res = await apiFetch(`/api/cameras/${id}`, { method: 'DELETE' })
   if (!res.ok && res.status !== 204) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.error || 'Failed to delete camera')
@@ -77,13 +92,13 @@ export async function deleteCamera(id) {
 }
 
 export async function fetchStreamStatus() {
-  const res = await fetch(url('/api/stream-status'))
+  const res = await apiFetch('/api/stream-status')
   if (!res.ok) throw new Error('Failed to fetch stream status')
   return res.json()
 }
 
 export async function restartStream(camId) {
-  const res = await fetch(url(`/api/stream-restart/${camId}`), { method: 'POST' })
+  const res = await apiFetch(`/api/stream-restart/${camId}`, { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.error || 'Failed to restart stream')
@@ -92,7 +107,7 @@ export async function restartStream(camId) {
 }
 
 export async function restartAllStreams() {
-  const res = await fetch(url('/api/stream-restart-all'), { method: 'POST' })
+  const res = await apiFetch('/api/stream-restart-all', { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.error || 'Failed to restart all streams')
@@ -101,7 +116,7 @@ export async function restartAllStreams() {
 }
 
 export async function fetchNvrEvents() {
-  const res = await fetch(url('/api/nvr-events'))
+  const res = await apiFetch('/api/nvr-events')
   if (!res.ok) throw new Error('Failed to fetch NVR events')
   return res.json()
 }
@@ -113,13 +128,13 @@ export function nvrEventsStreamUrl() {
 // ── Zones ────────────────────────────────────────────────────────────────────
 
 export async function fetchZones() {
-  const res = await fetch(url('/api/zones'))
+  const res = await apiFetch('/api/zones')
   if (!res.ok) throw new Error('Failed to fetch zones')
   return res.json()
 }
 
 export async function addZone(camera_id, name, points) {
-  const res = await fetch(url('/api/zones'), {
+  const res = await apiFetch('/api/zones', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ camera_id, name, points }),
@@ -132,12 +147,12 @@ export async function addZone(camera_id, name, points) {
 }
 
 export async function deleteZone(id) {
-  const res = await fetch(url(`/api/zones/${id}`), { method: 'DELETE' })
+  const res = await apiFetch(`/api/zones/${id}`, { method: 'DELETE' })
   if (!res.ok && res.status !== 204) throw new Error('Failed to delete zone')
 }
 
 export async function patchZone(id, body) {
-  const res = await fetch(url(`/api/zones/${id}`), {
+  const res = await apiFetch(`/api/zones/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -149,7 +164,7 @@ export async function patchZone(id, body) {
 // ── Known Faces ───────────────────────────────────────────────────────────────
 
 export async function fetchFaces() {
-  const res = await fetch(url('/api/faces'))
+  const res = await apiFetch('/api/faces')
   if (!res.ok) throw new Error('Failed to fetch faces')
   return res.json()
 }
@@ -158,7 +173,7 @@ export async function addFace(name, photoFile) {
   const fd = new FormData()
   fd.append('name', name)
   fd.append('photo', photoFile)
-  const res = await fetch(url('/api/faces'), { method: 'POST', body: fd })
+  const res = await apiFetch('/api/faces', { method: 'POST', body: fd })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.error || 'Failed to add face')
@@ -167,7 +182,7 @@ export async function addFace(name, photoFile) {
 }
 
 export async function deleteFace(id) {
-  const res = await fetch(url(`/api/faces/${id}`), { method: 'DELETE' })
+  const res = await apiFetch(`/api/faces/${id}`, { method: 'DELETE' })
   if (!res.ok && res.status !== 204) throw new Error('Failed to delete face')
 }
 
@@ -182,13 +197,13 @@ export function cameraSnapshotUrl(camId) {
 // ── Detection Events ──────────────────────────────────────────────────────────
 
 export async function fetchDetectionEvents(limit = 50, offset = 0) {
-  const res = await fetch(url(`/api/detection-events?limit=${limit}&offset=${offset}`))
+  const res = await apiFetch(`/api/detection-events?limit=${limit}&offset=${offset}`)
   if (!res.ok) throw new Error('Failed to fetch detection events')
   return res.json()
 }
 
 export async function clearDetectionEvents() {
-  const res = await fetch(url('/api/detection-events'), { method: 'DELETE' })
+  const res = await apiFetch('/api/detection-events', { method: 'DELETE' })
   if (!res.ok) throw new Error('Failed to clear events')
   return res.json()
 }
@@ -196,13 +211,13 @@ export async function clearDetectionEvents() {
 // ── Home / Away Mode ──────────────────────────────────────────────────────────
 
 export async function fetchMode() {
-  const res = await fetch(url('/api/mode'))
+  const res = await apiFetch('/api/mode')
   if (!res.ok) throw new Error('Failed to fetch mode')
   return res.json()   // { mode: 'home' | 'away' }
 }
 
 export async function postMode(mode) {
-  const res = await fetch(url('/api/mode'), {
+  const res = await apiFetch('/api/mode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode }),
@@ -214,13 +229,13 @@ export async function postMode(mode) {
 // ── AI Global Toggle ──────────────────────────────────────────────────────────
 
 export async function fetchAiConfig() {
-  const res = await fetch(url('/api/ai-config'))
+  const res = await apiFetch('/api/ai-config')
   if (!res.ok) throw new Error('Failed to fetch AI config')
   return res.json()   // { enabled: boolean }
 }
 
 export async function postAiConfig(enabled) {
-  const res = await fetch(url('/api/ai-config'), {
+  const res = await apiFetch('/api/ai-config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled }),
@@ -232,13 +247,13 @@ export async function postAiConfig(enabled) {
 // ── NVR Config ────────────────────────────────────────────────────────────────
 
 export async function fetchNvrConfig() {
-  const res = await fetch(url('/api/nvr-config'))
+  const res = await apiFetch('/api/nvr-config')
   if (!res.ok) throw new Error('Failed to fetch NVR config')
   return res.json()
 }
 
 export async function postNvrConfig(data) {
-  const res = await fetch(url('/api/nvr-config'), {
+  const res = await apiFetch('/api/nvr-config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -251,8 +266,66 @@ export async function postNvrConfig(data) {
 }
 
 export async function fetchNvrInfo() {
-  const res = await fetch(url('/api/nvr-info'))
+  const res = await apiFetch('/api/nvr-info')
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to fetch NVR info')
   return data.info
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+export async function fetchSession() {
+  const res = await apiFetch('/api/session')
+  if (!res.ok) throw new Error('Failed to fetch session')
+  return res.json()   // { authenticated: boolean, username?: string }
+}
+
+export async function login(username, password) {
+  const res = await apiFetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Login gagal')
+  }
+  return res.json()
+}
+
+export async function logout() {
+  await apiFetch('/api/logout', { method: 'POST' })
+}
+
+export async function fetchUsers() {
+  const res = await apiFetch('/api/users')
+  if (!res.ok) throw new Error('Failed to fetch users')
+  return res.json()
+}
+
+export async function createUser(username, password) {
+  const res = await apiFetch('/api/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to create user')
+  }
+  return res.json()
+}
+
+export async function deleteUser(id) {
+  const res = await apiFetch(`/api/users/${id}`, { method: 'DELETE' })
+  if (!res.ok && res.status !== 204) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to delete user')
+  }
+}
+
+export async function fetchLoginLog(limit = 100) {
+  const res = await apiFetch(`/api/login-log?limit=${limit}`)
+  if (!res.ok) throw new Error('Failed to fetch login log')
+  return res.json()
 }

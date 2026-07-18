@@ -1,5 +1,8 @@
 import React, { useEffect, useState } from 'react'
-import { fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo, fetchAiConfig, postAiConfig } from '../services/api'
+import {
+  fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo, fetchAiConfig, postAiConfig,
+  fetchUsers, createUser, deleteUser, fetchLoginLog, fetchSession,
+} from '../services/api'
 import ZoneEditor from '../features/detection/ZoneEditor'
 import FaceManager from '../features/detection/FaceManager'
 import EventHistory from '../features/detection/EventHistory'
@@ -9,9 +12,10 @@ const TABS = [
   { id: 'faces',   label: '👤 Wajah Dikenal' },
   { id: 'history', label: '📋 Riwayat Deteksi' },
   { id: 'nvr',     label: '📡 Kredensial NVR' },
+  { id: 'users',   label: '🔑 Users & Login' },
 ]
 
-export default function ConfigPage({ onBack }) {
+export default function ConfigPage({ onBack, onLogout }) {
   const [tab, setTab]         = useState('zones')
   const [cams, setCams]       = useState([])
   const [selectedCam, setSelectedCam] = useState(null)
@@ -33,6 +37,15 @@ export default function ConfigPage({ onBack }) {
   // AI global toggle (master switch — beda dari toggle ai_enabled per-kamera)
   const [aiEnabled, setAiEnabled] = useState(true)
   const [aiSaving,  setAiSaving]  = useState(false)
+
+  // Users & login log
+  const [users, setUsers]           = useState([])
+  const [loginLog, setLoginLog]     = useState([])
+  const [currentUser, setCurrentUser] = useState('')
+  const [newUsername, setNewUsername] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [userMsg, setUserMsg]       = useState(null)
+  const [userSaving, setUserSaving] = useState(false)
 
   const formatBytes = (value) => {
     if (!value) return '0 B'
@@ -91,6 +104,43 @@ export default function ConfigPage({ onBack }) {
     }
   }, [tab])
 
+  useEffect(() => {
+    if (tab !== 'users') return
+    fetchSession().then(s => setCurrentUser(s.username || '')).catch(() => {})
+    fetchUsers().then(setUsers).catch(() => setUserMsg({ ok: false, text: 'Gagal memuat daftar user' }))
+    fetchLoginLog().then(setLoginLog).catch(() => {})
+  }, [tab])
+
+  async function handleCreateUser(e) {
+    e.preventDefault()
+    const uname = newUsername.trim()
+    if (!uname) { setUserMsg({ ok: false, text: 'Username tidak boleh kosong' }); return }
+    if (newPassword.length < 6) { setUserMsg({ ok: false, text: 'Password minimal 6 karakter' }); return }
+    setUserSaving(true)
+    setUserMsg(null)
+    try {
+      const created = await createUser(uname, newPassword)
+      setUsers(prev => [...prev, created])
+      setNewUsername('')
+      setNewPassword('')
+      setUserMsg({ ok: true, text: `User '${created.username}' berhasil dibuat` })
+    } catch (err) {
+      setUserMsg({ ok: false, text: err.message })
+    } finally {
+      setUserSaving(false)
+    }
+  }
+
+  async function handleDeleteUser(u) {
+    if (!confirm(`Hapus user '${u.username}'?`)) return
+    try {
+      await deleteUser(u.id)
+      setUsers(prev => prev.filter(x => x.id !== u.id))
+    } catch (err) {
+      setUserMsg({ ok: false, text: err.message })
+    }
+  }
+
   async function handleNvrSave(e) {
     e.preventDefault()
     setNvrSaving(true)
@@ -123,6 +173,14 @@ export default function ConfigPage({ onBack }) {
         <div className="config-page-title">
           <span>🛡</span> Konfigurasi AI Deteksi
         </div>
+        <button
+          className="btn btn-ghost"
+          style={{ marginLeft: 'auto', fontSize: '.82rem', padding: '5px 12px' }}
+          onClick={onLogout}
+          title="Logout"
+        >
+          🚪 Logout
+        </button>
       </header>
 
       <div className={`ai-master-toggle ${aiEnabled ? '' : 'off'}`}>
@@ -379,6 +437,85 @@ export default function ConfigPage({ onBack }) {
             </form>
             <div className="nvr-cred-note">
               Channel 1-4 mengambil credential dari config ini lewat backend. Tombol restart stream di dashboard cukup untuk memuat ulang credential.
+            </div>
+          </div>
+        )}
+
+        {tab === 'users' && (
+          <div className="config-section">
+            <div className="config-section-intro">
+              Kelola akun yang bisa login ke dashboard. Sesi otomatis logout setelah idle
+              (lihat pengaturan <code style={{ color: 'var(--accent)' }}>SESSION_TIMEOUT_MINUTES</code>,
+              default 10 menit).
+            </div>
+
+            <form className="nvr-cred-form" onSubmit={handleCreateUser}>
+              <div className="nvr-cred-group-title">Tambah User</div>
+              <div className="nvr-cred-field">
+                <label>Username</label>
+                <input
+                  type="text"
+                  value={newUsername}
+                  onChange={e => { setNewUsername(e.target.value); setUserMsg(null) }}
+                  placeholder="mis. budi"
+                />
+              </div>
+              <div className="nvr-cred-field">
+                <label>Password</label>
+                <input
+                  type="password"
+                  value={newPassword}
+                  onChange={e => { setNewPassword(e.target.value); setUserMsg(null) }}
+                  placeholder="minimal 6 karakter"
+                  autoComplete="new-password"
+                />
+              </div>
+              {userMsg && (
+                <div className={`nvr-msg ${userMsg.ok ? 'ok' : 'err'}`}>{userMsg.text}</div>
+              )}
+              <button type="submit" className="btn" disabled={userSaving}>
+                {userSaving ? 'Menyimpan…' : '➕ Tambah User'}
+              </button>
+            </form>
+
+            <div className="nvr-info-card">
+              <div className="nvr-info-title">Daftar User</div>
+              {users.map(u => (
+                <div key={u.id} className="nvr-info-kv" style={{ justifyContent: 'space-between' }}>
+                  <span>
+                    <strong>{u.username}</strong>
+                    {u.username === currentUser && (
+                      <span style={{ color: 'var(--text-muted)', fontSize: '.72rem' }}> (kamu)</span>
+                    )}
+                  </span>
+                  <button
+                    className="btn-icon"
+                    title="Hapus user"
+                    onClick={() => handleDeleteUser(u)}
+                    disabled={u.username === currentUser || users.length <= 1}
+                  >
+                    🗑
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="nvr-info-card">
+              <div className="nvr-info-title">Riwayat Login</div>
+              {loginLog.length === 0 && (
+                <div className="nvr-info-empty">Belum ada riwayat login.</div>
+              )}
+              {loginLog.map(l => (
+                <div key={l.id} className="nvr-info-kv" style={{ justifyContent: 'space-between' }}>
+                  <span>
+                    <strong className={l.success ? 'nvr-ok' : 'nvr-bad'}>
+                      {l.success ? '✓' : '✗'} {l.username}
+                    </strong>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '.72rem' }}> — {l.ip || '—'}</span>
+                  </span>
+                  <span style={{ color: 'var(--text-muted)', fontSize: '.72rem' }}>{l.ts}</span>
+                </div>
+              ))}
             </div>
           </div>
         )}

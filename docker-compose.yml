@@ -35,6 +35,9 @@ services:
     volumes:
       - ./mtx/mediamtx.yml:/app/mediamtx.yml:ro
       - ./mtx/start_stream.sh:/app/start_stream.sh:ro
+      # Read-only: cuma untuk baca /data/.internal_token yang di-generate backend
+      # (autentikasi server-to-server ke /api/nvr-config — lihat DEPLOY.md § Auth).
+      - camera_data:/data:ro
     environment:
       # Fallback bila backend belum siap; nilai utama diambil dari
       # /api/nvr-config backend (database).
@@ -43,6 +46,8 @@ services:
       - DVR_PASS=${DVR_PASS:-}
       - HWACCEL=${HWACCEL:-}
       - VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
+    depends_on:
+      - backend
     networks:
       - hd-net
     restart: unless-stopped
@@ -85,6 +90,15 @@ services:
       - RTSP_PORT=8554
       - HWACCEL=${HWACCEL:-}
       - VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
+      # Seed user pertama — hanya dipakai saat tabel users masih kosong.
+      # GANTI passwordnya lewat menu Konfigurasi > Users setelah login pertama.
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS:-admin123}
+      # Sesi browser idle lebih dari ini (menit) wajib login ulang.
+      - SESSION_TIMEOUT_MINUTES=${SESSION_TIMEOUT_MINUTES:-10}
+      # Set "true" hanya kalau dashboard diakses lewat reverse proxy HTTPS —
+      # HTTP polos (default LAN) wajib biarkan ini kosong/false.
+      - COOKIE_SECURE=${COOKIE_SECURE:-}
     volumes:
       - camera_data:/data
       # Docker socket (read-only) untuk panel resource server di dashboard

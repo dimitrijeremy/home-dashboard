@@ -48,6 +48,18 @@ FACE_EVERY_SECS = float(os.getenv("FACE_EVERY_SECS", "2.0"))
 # Ukuran inferensi YOLO; turunkan (mis. 480/416) untuk hemat CPU signifikan.
 YOLO_IMGSZ    = int(os.getenv("YOLO_IMGSZ", "640"))
 
+# /api/* backend sekarang butuh login browser ATAU token internal ini
+# (server-to-server, dibaca dari file di volume /data yang sama dengan backend).
+_INTERNAL_TOKEN_PATH = os.path.join(SNAPSHOT_DIR, "..", ".internal_token")
+
+
+def _backend_headers():
+    try:
+        with open(_INTERNAL_TOKEN_PATH) as f:
+            return {"X-Internal-Token": f.read().strip()}
+    except OSError:
+        return {}
+
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 # ── Model Loading (done once at startup) ─────────────────────────────────────
@@ -115,6 +127,7 @@ def _post_event(channel_id: str, camera_name: str, event_type: str,
                 "confidence":  round(confidence, 3) if confidence else None,
                 "extra_json":  json.dumps(extra_json) if extra_json else None,
             },
+            headers=_backend_headers(),
             timeout=4,
         )
     except Exception as e:
@@ -188,7 +201,7 @@ def _emit_face_event(channel_id: str, camera_name: str, event_extra: dict,
 # ── DB Refresh ────────────────────────────────────────────────────────────────
 def refresh_face_db():
     try:
-        r = requests.get(f"{BACKEND_URL}/api/faces?include_photo=1", timeout=10)
+        r = requests.get(f"{BACKEND_URL}/api/faces?include_photo=1", headers=_backend_headers(), timeout=10)
         if r.status_code != 200:
             return
         faces_data = r.json()
@@ -223,7 +236,7 @@ def refresh_face_db():
 
 def refresh_zone_db():
     try:
-        r = requests.get(f"{BACKEND_URL}/api/zones", timeout=8)
+        r = requests.get(f"{BACKEND_URL}/api/zones", headers=_backend_headers(), timeout=8)
         if r.status_code != 200:
             return
         new_db: dict = {}
@@ -392,7 +405,7 @@ def _ai_globally_enabled() -> bool:
     """
     global _ai_globally_off_logged
     try:
-        r = requests.get(f"{BACKEND_URL}/api/ai-config", timeout=5)
+        r = requests.get(f"{BACKEND_URL}/api/ai-config", headers=_backend_headers(), timeout=5)
         enabled = bool(r.json().get("enabled", True)) if r.status_code == 200 else True
     except Exception as e:
         log.warning(f"ai-config fetch error, assuming enabled: {e}")
@@ -415,7 +428,7 @@ def sync_workers():
         return
 
     try:
-        r = requests.get(f"{BACKEND_URL}/api/cameras", timeout=8)
+        r = requests.get(f"{BACKEND_URL}/api/cameras", headers=_backend_headers(), timeout=8)
         if r.status_code != 200:
             return
         cameras = r.json()
@@ -461,7 +474,7 @@ def main():
     # Initial DB load (wait for backend to be ready)
     for attempt in range(15):
         try:
-            r = requests.get(f"{BACKEND_URL}/api/cameras", timeout=5)
+            r = requests.get(f"{BACKEND_URL}/api/cameras", headers=_backend_headers(), timeout=5)
             if r.status_code == 200:
                 break
         except Exception:

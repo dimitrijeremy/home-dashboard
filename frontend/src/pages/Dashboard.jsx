@@ -219,7 +219,7 @@ const VIEW_MODES = [
   { id: 'grid1', icon: '▬', label: 'Full',      cols: 1 },
 ]
 
-export default function Dashboard({ onConfig }) {
+export default function Dashboard({ onConfig, onLogout }) {
   const [cams,        setCams]        = useState([])
   const [zones,       setZones]       = useState([])
   const [error,       setError]       = useState(null)
@@ -349,6 +349,14 @@ export default function Dashboard({ onConfig }) {
             title="Konfigurasi AI Deteksi"
           >
             ⚙
+          </button>
+          <button
+            className="btn btn-ghost"
+            style={{ fontSize: '.82rem', padding: '4px 10px' }}
+            onClick={onLogout}
+            title="Logout"
+          >
+            🚪
           </button>
           <div className="online-dot" title="Online" />
         </div>
