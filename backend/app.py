@@ -827,8 +827,24 @@ def init_db():
     ensure_nvr_event_columns(con)
     sync_camera_rows(con)
     con.commit()
-    restore_custom_streams(con)
     con.close()
+    # Latar belakang — bukan blocking di sini. Tiap kamera custom bisa butuh
+    # sampai ~4 percobaan probe x beberapa detik (_normalize_rtsp_source) untuk
+    # cari varian URL yang benar; sekuensial dan makin lama makin banyak kamera
+    # custom yang terdaftar. Kalau ini dijalankan sinkron di sini (proses impor
+    # modul, sebelum gunicorn worker selesai boot), total waktunya bisa lebih
+    # lama dari worker timeout gunicorn (default 30s) → worker dibunuh terus,
+    # reboot berulang, dan backend TIDAK PERNAH selesai start (semua request
+    # menggantung selamanya, termasuk /api/login).
+    threading.Thread(target=_restore_custom_streams_bg, daemon=True, name="restore-streams").start()
+
+
+def _restore_custom_streams_bg():
+    con = sqlite3.connect(DB_PATH)
+    try:
+        restore_custom_streams(con)
+    finally:
+        con.close()
 
 # ── Auth Routes ───────────────────────────────────────────────
 # Satu tingkat akses saja (tidak ada admin vs user biasa) — cocok untuk

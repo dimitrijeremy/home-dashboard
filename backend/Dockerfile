@@ -31,4 +31,7 @@ RUN cp /app/start_custom_stream.sh /start_custom_stream.sh && \
     chmod +x /start_custom_stream.sh
 
 EXPOSE 5000
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--worker-class", "gthread", "--threads", "8", "app:app"]
+# --timeout lebih longgar dari default (30s) — beberapa endpoint (mis.
+# /api/nvr-info yang probe NVR langsung) bisa sah butuh waktu lebih lama,
+# dan worker yang di-kill di tengah request panjang cuma bikin retry-loop.
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--worker-class", "gthread", "--threads", "8", "--timeout", "90", "app:app"]
