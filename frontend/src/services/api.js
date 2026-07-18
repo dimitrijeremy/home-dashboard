@@ -329,3 +329,22 @@ export async function fetchLoginLog(limit = 100) {
   if (!res.ok) throw new Error('Failed to fetch login log')
   return res.json()
 }
+
+export async function fetchLoginWhitelist() {
+  const res = await apiFetch('/api/login-whitelist')
+  if (!res.ok) throw new Error('Failed to fetch login whitelist')
+  return res.json()   // { cidrs: string, extra_env: string }
+}
+
+export async function saveLoginWhitelist(cidrs) {
+  const res = await apiFetch('/api/login-whitelist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cidrs }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || 'Failed to save login whitelist')
+  }
+  return res.json()
+}

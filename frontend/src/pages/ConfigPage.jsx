@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import {
   fetchCameras, fetchNvrConfig, postNvrConfig, fetchNvrInfo, fetchAiConfig, postAiConfig,
   fetchUsers, createUser, deleteUser, fetchLoginLog, fetchSession,
+  fetchLoginWhitelist, saveLoginWhitelist,
 } from '../services/api'
 import ZoneEditor from '../features/detection/ZoneEditor'
 import FaceManager from '../features/detection/FaceManager'
@@ -46,6 +47,12 @@ export default function ConfigPage({ onBack, onLogout }) {
   const [newPassword, setNewPassword] = useState('')
   const [userMsg, setUserMsg]       = useState(null)
   const [userSaving, setUserSaving] = useState(false)
+
+  // Whitelist segmen sumber login
+  const [wlCidrs, setWlCidrs]       = useState('')
+  const [wlExtraEnv, setWlExtraEnv] = useState('')
+  const [wlMsg, setWlMsg]           = useState(null)
+  const [wlSaving, setWlSaving]     = useState(false)
 
   const formatBytes = (value) => {
     if (!value) return '0 B'
@@ -109,7 +116,25 @@ export default function ConfigPage({ onBack, onLogout }) {
     fetchSession().then(s => setCurrentUser(s.username || '')).catch(() => {})
     fetchUsers().then(setUsers).catch(() => setUserMsg({ ok: false, text: 'Gagal memuat daftar user' }))
     fetchLoginLog().then(setLoginLog).catch(() => {})
+    fetchLoginWhitelist()
+      .then(d => { setWlCidrs(d.cidrs || ''); setWlExtraEnv(d.extra_env || '') })
+      .catch(() => {})
   }, [tab])
+
+  async function handleSaveWhitelist(e) {
+    e.preventDefault()
+    setWlSaving(true)
+    setWlMsg(null)
+    try {
+      const saved = await saveLoginWhitelist(wlCidrs)
+      setWlCidrs(saved.cidrs)
+      setWlMsg({ ok: true, text: 'Whitelist tersimpan — berlaku untuk percobaan login berikutnya' })
+    } catch (err) {
+      setWlMsg({ ok: false, text: err.message })
+    } finally {
+      setWlSaving(false)
+    }
+  }
 
   async function handleCreateUser(e) {
     e.preventDefault()
@@ -500,6 +525,32 @@ export default function ConfigPage({ onBack, onLogout }) {
               ))}
             </div>
 
+            <form className="nvr-cred-form" onSubmit={handleSaveWhitelist}>
+              <div className="nvr-cred-group-title">Whitelist Segmen Login</div>
+              <div className="nvr-cred-field">
+                <label>CIDR yang diizinkan (pisah koma)</label>
+                <input
+                  type="text"
+                  value={wlCidrs}
+                  onChange={e => { setWlCidrs(e.target.value); setWlMsg(null) }}
+                  placeholder="mis. 10.10.100.0/24,10.10.80.0/24"
+                />
+                <small style={{ fontSize: '.72rem', color: 'var(--text-muted)' }}>
+                  Login hanya bisa dari segmen ini; percobaan dari luar ditolak dan tercatat
+                  di riwayat sebagai 🚫. Sistem menolak menyimpan whitelist yang tidak memuat
+                  IP kamu sendiri (anti terkunci). Pintu darurat: env{' '}
+                  <code style={{ color: 'var(--accent)' }}>EXTRA_LOGIN_CIDRS</code> di .env
+                  server selalu ikut diizinkan{wlExtraEnv ? ` (sekarang: ${wlExtraEnv})` : ' (sekarang kosong)'}.
+                </small>
+              </div>
+              {wlMsg && (
+                <div className={`nvr-msg ${wlMsg.ok ? 'ok' : 'err'}`}>{wlMsg.text}</div>
+              )}
+              <button type="submit" className="btn" disabled={wlSaving}>
+                {wlSaving ? 'Menyimpan…' : '🛡 Simpan Whitelist'}
+              </button>
+            </form>
+
             <div className="nvr-info-card">
               <div className="nvr-info-title">Riwayat Login</div>
               {loginLog.length === 0 && (
@@ -509,7 +560,7 @@ export default function ConfigPage({ onBack, onLogout }) {
                 <div key={l.id} className="nvr-info-kv" style={{ justifyContent: 'space-between' }}>
                   <span>
                     <strong className={l.success ? 'nvr-ok' : 'nvr-bad'}>
-                      {l.success ? '✓' : '✗'} {l.username}
+                      {l.blocked ? '🚫' : l.success ? '✓' : '✗'} {l.username}
                     </strong>
                     <span style={{ color: 'var(--text-muted)', fontSize: '.72rem' }}> — {l.ip || '—'}</span>
                   </span>

@@ -99,6 +99,18 @@ services:
       # Set "true" hanya kalau dashboard diakses lewat reverse proxy HTTPS —
       # HTTP polos (default LAN) wajib biarkan ini kosong/false.
       - COOKIE_SECURE=${COOKIE_SECURE:-}
+      # Whitelist segmen yang boleh login (seed awal; sesudahnya via UI).
+      # EXTRA_LOGIN_CIDRS = pintu darurat anti-lockout (selalu di-union).
+      - ALLOWED_LOGIN_CIDRS=${ALLOWED_LOGIN_CIDRS:-10.10.100.0/24,10.10.80.0/24}
+      - EXTRA_LOGIN_CIDRS=${EXTRA_LOGIN_CIDRS:-}
+      # Interval scan keamanan NVR (akun baru + log login), detik
+      - NVR_SECURITY_SCAN_SECS=${NVR_SECURITY_SCAN_SECS:-300}
+      # Postgres monitoring mirror (DBeaver) — PG_HOST kosong = mati
+      - PG_HOST=pg
+      - PG_PORT=5432
+      - PG_DB=${PG_DB:-monitoring}
+      - PG_USER=${PG_USER:-monitor}
+      - PG_PASS=${PG_PASS:-monitor-change-me}
     volumes:
       - camera_data:/data
       # Docker socket (read-only) untuk panel resource server di dashboard
@@ -137,11 +149,37 @@ services:
     mem_limit: 256m
     ports:
       # Ganti 8088 ke port yang tersedia di server (80 dan 443 biasanya sudah terpakai).
-      # Akses dashboard: http://<server-ip>:8088
+      # Akses dashboard: http://<server-ip>:8088 atau https://<server-ip>:8443
       # Atau tambahkan sebagai vhost di reverse proxy yang sudah ada (lihat README).
       - "8088:80"
+      - "8443:443"
+    volumes:
+      # Sertifikat TLS — isi dengan tls/gen-certs.sh di host (lihat MONITORING.md).
+      # Kalau kosong, container membuat self-signed sementara supaya tetap start.
+      - ./tls/certs:/etc/nginx/tls
     depends_on:
       - backend
+    networks:
+      - hd-net
+    restart: unless-stopped
+
+  # ── Postgres: monitoring DB terpisah (akses DBeaver dari luar) ────────────
+  # Berisi SALINAN read-only tabel monitoring (login_log, detection_events,
+  # nvr_events, cameras ter-redact) — bukan DB utama aplikasi. Kalau DB ini
+  # mati/di-reset, dashboard tetap jalan normal dan data tersinkron ulang.
+  pg:
+    image: postgres:16-alpine
+    cpus: 1.0
+    mem_limit: 512m
+    environment:
+      - POSTGRES_DB=${PG_DB:-monitoring}
+      - POSTGRES_USER=${PG_USER:-monitor}
+      # GANTI di .env — port ini terekspos ke LAN untuk DBeaver.
+      - POSTGRES_PASSWORD=${PG_PASS:-monitor-change-me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
     networks:
       - hd-net
     restart: unless-stopped
@@ -152,3 +190,4 @@ networks:
 
 volumes:
   camera_data:
+  pg_data:

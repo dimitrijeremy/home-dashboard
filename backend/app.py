@@ -128,6 +128,13 @@ DVR_EVENT_PASS = os.getenv("DVR_EVENT_PASS") or DVR_PASS
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
+# Whitelist segmen sumber yang boleh login (CIDR, dipisah koma). Nilai env
+# hanya seed awal setting 'login_whitelist'; sesudahnya dikelola dari UI.
+ALLOWED_LOGIN_CIDRS = os.getenv("ALLOWED_LOGIN_CIDRS", "10.10.100.0/24,10.10.80.0/24")
+# Pintu darurat anti-lockout: CIDR ekstra dari env yang SELALU di-union dengan
+# whitelist di DB — kalau terkunci (PC admin tidak masuk whitelist), tambahkan
+# segmen di sini lalu `docker compose up -d backend`, tanpa perlu bedah DB.
+EXTRA_LOGIN_CIDRS = os.getenv("EXTRA_LOGIN_CIDRS", "")
 
 
 def _get_or_create_secret_file(path, nbytes=32):
@@ -800,9 +807,13 @@ def init_db():
             ts       TEXT    NOT NULL,
             username TEXT    NOT NULL,
             success  INTEGER NOT NULL,
-            ip       TEXT
+            ip       TEXT,
+            blocked  INTEGER NOT NULL DEFAULT 0
         )
     """)
+    existing_ll = {row[1] for row in con.execute("PRAGMA table_info(login_log)")}
+    if "blocked" not in existing_ll:
+        con.execute("ALTER TABLE login_log ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
     if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         con.execute(
             "INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)",
@@ -816,6 +827,7 @@ def init_db():
     # Seed default settings (env hanya jadi nilai awal; selanjutnya dikelola via UI)
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('mode', 'home')")
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_global_enabled', '1')")
+    con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('login_whitelist', ?)", (ALLOWED_LOGIN_CIDRS,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_host', ?)", (DVR_HOST,))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('nvr_http_port', ?)", (str(DVR_HTTP_PORT),))
     con.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('builtin_channel_count', ?)", (os.getenv("NVR_CHANNELS", "4"),))
@@ -854,6 +866,38 @@ def _client_ip():
     return request.headers.get('X-Real-IP') or request.remote_addr or ''
 
 
+def _login_whitelist_networks():
+    """Gabungan whitelist dari DB (editable via UI) + env EXTRA_LOGIN_CIDRS
+    (pintu darurat anti-lockout). Entri tidak valid dilewati diam-diam."""
+    import ipaddress
+    raw = _db_setting('login_whitelist', ALLOWED_LOGIN_CIDRS)
+    combined = f"{raw},{EXTRA_LOGIN_CIDRS}"
+    nets = []
+    for part in combined.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            pass
+    return nets
+
+
+def _ip_login_allowed(ip_str):
+    import ipaddress
+    nets = _login_whitelist_networks()
+    if not nets:
+        # Whitelist kosong total = tidak ada yang bisa login — anggap salah
+        # konfigurasi dan izinkan semua daripada mengunci seluruh akses.
+        return True
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
 @app.route('/api/login', methods=['POST'])
 def login_route():
     body = request.get_json(silent=True) or {}
@@ -861,6 +905,16 @@ def login_route():
     password = body.get('password') or ''
 
     db = get_db()
+    ip = _client_ip()
+    if not _ip_login_allowed(ip):
+        db.execute(
+            "INSERT INTO login_log (ts, username, success, ip, blocked) VALUES (?,?,0,?,1)",
+            (datetime.utcnow().isoformat(), username or '(kosong)', ip),
+        )
+        db.commit()
+        print(f"[AUTH] Login DIBLOKIR dari {ip} (di luar whitelist) user='{username}'", flush=True)
+        return jsonify({'error': 'Akses login dari jaringan ini tidak diizinkan'}), 403
+
     row = db.execute(
         "SELECT id, username, password_hash FROM users WHERE username=?", (username,)
     ).fetchone()
@@ -868,7 +922,7 @@ def login_route():
 
     db.execute(
         "INSERT INTO login_log (ts, username, success, ip) VALUES (?,?,?,?)",
-        (datetime.utcnow().isoformat(), username or '(kosong)', 1 if ok else 0, _client_ip()),
+        (datetime.utcnow().isoformat(), username or '(kosong)', 1 if ok else 0, ip),
     )
     db.commit()
 
@@ -945,9 +999,47 @@ def get_login_log():
     except (TypeError, ValueError):
         limit = 100
     rows = get_db().execute(
-        "SELECT id, ts, username, success, ip FROM login_log ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT id, ts, username, success, ip, blocked FROM login_log ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/login-whitelist', methods=['GET'])
+def get_login_whitelist():
+    return jsonify({
+        'cidrs': _db_setting('login_whitelist', ALLOWED_LOGIN_CIDRS),
+        'extra_env': EXTRA_LOGIN_CIDRS,
+    })
+
+
+@app.route('/api/login-whitelist', methods=['POST'])
+def set_login_whitelist():
+    import ipaddress
+    body = request.get_json(silent=True) or {}
+    raw = (body.get('cidrs') or '').strip()
+    parts = [p.strip() for p in raw.split(',') if p.strip()]
+    if not parts:
+        return jsonify({'error': 'Whitelist tidak boleh kosong'}), 400
+    for part in parts:
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            return jsonify({'error': f'CIDR tidak valid: {part}'}), 400
+    # Tolak penyimpanan yang akan mengunci admin yang sedang menyimpannya.
+    ip = _client_ip()
+    try:
+        addr = ipaddress.ip_address(ip)
+        nets = [ipaddress.ip_network(p, strict=False) for p in parts]
+        extra = [ipaddress.ip_network(p.strip(), strict=False)
+                 for p in EXTRA_LOGIN_CIDRS.split(',') if p.strip()]
+        if not any(addr in n for n in nets + extra):
+            return jsonify({'error': f'Ditolak: IP kamu sendiri ({ip}) tidak masuk whitelist ini — kamu akan terkunci'}), 400
+    except ValueError:
+        pass
+    value = ','.join(parts)
+    _set_db_setting('login_whitelist', value)
+    print(f"[AUTH] Login whitelist diubah menjadi: {value}", flush=True)
+    return jsonify({'cidrs': value})
 
 
 # ── Routes ──────────────────────────────────────────────────
@@ -1681,6 +1773,147 @@ def stream_nvr_events():
     )
 
 
+# ── NVR Security Watch ───────────────────────────────────────────────────────
+# Latar: pernah muncul akun admin misterius ("CISA") di NVR — indikasi akses
+# tidak sah. Worker ini memantau dua hal lewat CGI API Dahua:
+#   1. Daftar akun user NVR — akun baru/hilang memicu event NvrUserAdded/
+#      NvrUserRemoved di feed event dashboard (baseline direkam diam-diam
+#      pada scan pertama).
+#   2. Log login NVR — login oleh user di luar akun service dashboard
+#      (stream/event user) memicu event NvrLoginDetected.
+# Semua event masuk ke tabel nvr_events (tampil di feed + tersinkron ke
+# Postgres monitoring), jadi jejaknya bisa diaudit dari DBeaver juga.
+
+NVR_SECURITY_SCAN_SECS = int(os.getenv("NVR_SECURITY_SCAN_SECS", "300"))
+
+
+def _parse_dahua_indexed(text, prefix):
+    """Parse baris 'prefix[N].Key=V' / 'prefix[N].Key.Sub=V' → {N: {key: v}}."""
+    out = {}
+    pattern = re.compile(rf'^{re.escape(prefix)}\[(\d+)\]\.(.+?)=(.*)$')
+    for line in text.splitlines():
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        idx, key, value = int(m.group(1)), m.group(2), m.group(3)
+        out.setdefault(idx, {})[key] = value
+    return out
+
+
+def _emit_security_event(code, detail):
+    event = {
+        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "code": code,
+        "action": "Security",
+        "index": 0,
+        "channel_number": None,
+        "source": "security",
+        **detail,
+    }
+    event["id"] = _store_nvr_event(event)
+    with _nvr_lock:
+        _nvr_events.appendleft(event)
+        _nvr_bump_locked()
+    print(f"[SECURITY] {code}: {detail}", flush=True)
+
+
+def _nvr_security_scan_users():
+    text = _nvr_cgi_text('/cgi-bin/userManager.cgi?action=getUserInfoAll')
+    parsed = _parse_dahua_indexed(text, 'users')
+    current = {}
+    for info in parsed.values():
+        name = info.get('Name')
+        if name:
+            current[name] = {
+                'group': info.get('Group', ''),
+                'memo': info.get('Memo', ''),
+            }
+    if not current:
+        return  # respons tidak terparse — jangan rusak baseline
+
+    prev_raw = _db_setting('nvr_user_snapshot')
+    if not prev_raw:
+        _set_db_setting('nvr_user_snapshot', json.dumps(current))
+        print(f"[SECURITY] Baseline akun NVR direkam: {sorted(current)}", flush=True)
+        return
+
+    prev = json.loads(prev_raw)
+    for name in sorted(set(current) - set(prev)):
+        _emit_security_event('NvrUserAdded', {
+            'username': name,
+            'group': current[name]['group'],
+            'memo': current[name]['memo'],
+        })
+    for name in sorted(set(prev) - set(current)):
+        _emit_security_event('NvrUserRemoved', {'username': name})
+    if current != prev:
+        _set_db_setting('nvr_user_snapshot', json.dumps(current))
+
+
+def _nvr_security_scan_logins():
+    # Akun service milik dashboard sendiri login ke NVR terus-menerus
+    # (RTSP/event stream) — di-ignore supaya feed tidak banjir.
+    stream_user, _ = _get_nvr_stream_creds()
+    event_user, _ = _get_nvr_event_creds()
+    ignore = {u for u in (stream_user, event_user) if u}
+
+    last = _db_setting('nvr_seclog_last')
+    if not last:
+        last = (datetime.utcnow() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+    now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+    start = urlencode({'condition.StartTime': last, 'condition.EndTime': now_str})
+    text = _nvr_cgi_text(f'/cgi-bin/log.cgi?action=startFind&{start}&condition.Types[0]=Login')
+    m = re.search(r'token=(\d+)', text)
+    if not m:
+        return
+    token = m.group(1)
+    try:
+        found = _nvr_cgi_text(f'/cgi-bin/log.cgi?action=doFind&token={token}&count=100')
+        items = _parse_dahua_indexed(found, 'items')
+    finally:
+        try:
+            _nvr_cgi_text(f'/cgi-bin/log.cgi?action=stopFind&token={token}')
+        except Exception:
+            pass
+
+    max_ts = last
+    for info in items.values():
+        ts = info.get('Time', '')
+        user = info.get('User') or info.get('UserName') or ''
+        addr = info.get('LogAddress') or info.get('Detail.Address') or info.get('Address') or ''
+        if ts > max_ts:
+            max_ts = ts
+        if not user or user in ignore:
+            continue
+        _emit_security_event('NvrLoginDetected', {
+            'username': user,
+            'from_address': addr,
+            'nvr_time': ts,
+        })
+    if max_ts != last:
+        _set_db_setting('nvr_seclog_last', max_ts)
+
+
+_nvr_security_last_error = [None]
+
+
+def _nvr_security_worker():
+    time.sleep(30)  # beri waktu backend & konfigurasi NVR siap
+    while True:
+        for step in (_nvr_security_scan_users, _nvr_security_scan_logins):
+            try:
+                step()
+                _nvr_security_last_error[0] = None
+            except Exception as e:
+                msg = str(e)[:120]
+                # Log hanya saat error berubah — hindari spam tiap 5 menit
+                if msg != _nvr_security_last_error[0]:
+                    print(f"[SECURITY] scan gagal ({step.__name__}): {msg}", flush=True)
+                    _nvr_security_last_error[0] = msg
+        time.sleep(NVR_SECURITY_SCAN_SECS)
+
+
 @app.route('/api/nvr-config', methods=['GET'])
 def get_nvr_config():
     stream_user, stream_pass = _get_nvr_stream_creds()
@@ -2224,8 +2457,107 @@ def get_nvr_event_clip(event_id):
     return send_file(row['clip_path'], mimetype='video/mp4', conditional=True, max_age=300)
 
 
+# ── Postgres monitoring mirror ───────────────────────────────────────────────
+# DB terpisah untuk analisa/audit dari luar (DBeaver): backend menyalin tabel
+# monitoring dari SQLite ke Postgres secara periodik (satu arah, incremental).
+# SENGAJA tidak menyalin tabel users/settings — di sana ada password hash dan
+# kredensial NVR; kolom rtsp_url kamera juga di-redact sebelum disalin.
+# PG_HOST kosong = fitur mati total (aman kalau container pg tidak jalan).
+
+PG_HOST = os.getenv("PG_HOST", "")
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_DB   = os.getenv("PG_DB", "monitoring")
+PG_USER = os.getenv("PG_USER", "monitor")
+PG_PASS = os.getenv("PG_PASS", "")
+PG_SYNC_SECS = int(os.getenv("PG_SYNC_SECS", "60"))
+
+_PG_TABLES = {
+    'login_log': "id BIGINT PRIMARY KEY, ts TEXT, username TEXT, success INT, ip TEXT, blocked INT",
+    'detection_events': ("id BIGINT PRIMARY KEY, ts TEXT, channel_id TEXT, camera_name TEXT, "
+                         "event_type TEXT, zone_name TEXT, person_name TEXT, confidence REAL, "
+                         "alarm_triggered INT, extra_json TEXT"),
+    'nvr_events': ("id BIGINT PRIMARY KEY, ts TEXT, code TEXT, action TEXT, event_index INT, "
+                   "channel_number INT, source TEXT, extra_json TEXT"),
+}
+_PG_COLS = {name: [c.split()[0] for c in ddl.split(', ')] for name, ddl in _PG_TABLES.items()}
+
+
+def _redact_url_creds(url):
+    # [^/]* greedy sampai '@' TERAKHIR sebelum path — password yang mengandung
+    # '@' (umum di kredensial NVR di sini) tetap ter-redact utuh.
+    return re.sub(r'//[^/]*@', '//', url or '')
+
+
+def _pg_sync_cycle():
+    import psycopg2  # lazy: hanya dibutuhkan bila PG_HOST diisi
+    pg = psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+                          user=PG_USER, password=PG_PASS, connect_timeout=5)
+    pg.autocommit = True
+    lite = sqlite3.connect(DB_PATH)
+    lite.row_factory = sqlite3.Row
+    try:
+        cur = pg.cursor()
+        for name, ddl in _PG_TABLES.items():
+            cur.execute(f"CREATE TABLE IF NOT EXISTS {name} ({ddl})")
+        cur.execute("""CREATE TABLE IF NOT EXISTS cameras (
+            id BIGINT PRIMARY KEY, name TEXT, channel INT, builtin INT,
+            ai_enabled INT, ptz_supported INT, stream_url TEXT, rtsp_url_redacted TEXT)""")
+
+        for name, cols in _PG_COLS.items():
+            cur.execute(f"SELECT COALESCE(MAX(id), 0) FROM {name}")
+            last_id = cur.fetchone()[0]
+            rows = lite.execute(
+                f"SELECT {', '.join(cols)} FROM {name} WHERE id > ? ORDER BY id LIMIT 1000",
+                (last_id,)
+            ).fetchall()
+            if rows:
+                placeholders = ', '.join(['%s'] * len(cols))
+                cur.executemany(
+                    f"INSERT INTO {name} ({', '.join(cols)}) VALUES ({placeholders}) ON CONFLICT (id) DO NOTHING",
+                    [tuple(r[c] for c in cols) for r in rows],
+                )
+
+        # cameras: kecil — full refresh supaya rename/hapus ikut tercermin
+        cams = lite.execute(
+            "SELECT id, name, channel, builtin, ai_enabled, ptz_supported, stream_url, rtsp_url FROM cameras"
+        ).fetchall()
+        cur.execute("DELETE FROM cameras")
+        cur.executemany(
+            "INSERT INTO cameras VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            [(r['id'], r['name'], r['channel'], r['builtin'], r['ai_enabled'],
+              r['ptz_supported'], r['stream_url'], _redact_url_creds(r['rtsp_url'])) for r in cams],
+        )
+    finally:
+        lite.close()
+        pg.close()
+
+
+_pg_last_error = [None]
+
+
+def _pg_sync_worker():
+    time.sleep(15)
+    while True:
+        try:
+            _pg_sync_cycle()
+            if _pg_last_error[0] is not None:
+                print("[PG-SYNC] pulih — sinkronisasi jalan lagi", flush=True)
+            _pg_last_error[0] = None
+        except Exception as e:
+            msg = str(e)[:150]
+            if msg != _pg_last_error[0]:
+                print(f"[PG-SYNC] gagal: {msg}", flush=True)
+                _pg_last_error[0] = msg
+        time.sleep(PG_SYNC_SECS)
+
+
 _nvr_thread = threading.Thread(target=_nvr_event_worker, daemon=True, name="nvr-events")
 _nvr_thread.start()
+
+threading.Thread(target=_nvr_security_worker, daemon=True, name="nvr-security").start()
+
+if PG_HOST:
+    threading.Thread(target=_pg_sync_worker, daemon=True, name="pg-sync").start()
 
 init_db()
 

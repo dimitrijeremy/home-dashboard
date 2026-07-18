@@ -1,0 +1,43 @@
+# Shared locations — di-include oleh server block HTTP (80) dan HTTPS (443).
+
+# ── REST API → backend container ──────────────────────────────────────────
+location /api/ {
+    set $backend_host "backend:5000";
+    proxy_pass         http://$backend_host;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;   # panjang untuk SSE (/api/nvr-events/stream)
+    proxy_buffering    off;    # wajib untuk Server-Sent Events
+    proxy_cache        off;
+}
+
+# ── HLS stream dari MediaMTX → mtx container ──────────────────────────────
+# Path: /ch1/, /ch2/, /ch3/, /ch4/, /custom_<hex>/
+# Jika mtx tidak jalan (dev mode), nginx tetap start — request ke path ini 502.
+location ~ ^/(ch\d+|custom_[0-9a-f]+)/ {
+    set $mtx_host "mtx:8888";
+    proxy_pass         http://$mtx_host;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_read_timeout 30s;
+    proxy_buffering    off;
+    add_header         Cache-Control "no-cache";
+    add_header         Access-Control-Allow-Origin "*";
+}
+
+# ── Asset ber-hash (dist/assets/*) — aman di-cache lama, nama file berubah
+# tiap build kalau isinya berubah.
+location /assets/ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+}
+
+# ── SPA fallback ─────────────────────────────────────────────────────────
+# index.html WAJIB tidak di-cache — kalau browser nyimpen versi lama,
+# dia akan minta file JS/CSS ber-hash lama yang sudah dihapus pas rebuild
+# berikutnya, hasilnya halaman kosong (cuma background color yang keliatan).
+location / {
+    add_header Cache-Control "no-cache";
+    try_files $uri $uri/ /index.html;
+}
