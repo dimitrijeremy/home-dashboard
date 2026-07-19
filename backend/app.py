@@ -130,7 +130,7 @@ ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
 # Whitelist segmen sumber yang boleh login (CIDR, dipisah koma). Nilai env
 # hanya seed awal setting 'login_whitelist'; sesudahnya dikelola dari UI.
-ALLOWED_LOGIN_CIDRS = os.getenv("ALLOWED_LOGIN_CIDRS", "10.10.100.0/24,10.10.80.0/24")
+ALLOWED_LOGIN_CIDRS = os.getenv("ALLOWED_LOGIN_CIDRS", "10.10.100.0/24,10.10.80.0/24,127.0.0.1/32")
 # Pintu darurat anti-lockout: CIDR ekstra dari env yang SELALU di-union dengan
 # whitelist di DB — kalau terkunci (PC admin tidak masuk whitelist), tambahkan
 # segmen di sini lalu `docker compose up -d backend`, tanpa perlu bedah DB.

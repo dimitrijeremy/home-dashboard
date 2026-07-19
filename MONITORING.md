@@ -16,7 +16,7 @@ Perlakukan NVR sebagai perangkat yang sudah pernah dibobol:
    - Matikan **UPnP** di router (NVR bisa buka port sendiri lewat UPnP).
    - Matikan fitur **P2P/cloud (DMSS/Easy4IP)** di NVR kalau tidak dipakai —
      ini kanal keluar yang aktif terus walau tidak ada port forward.
-   - Idealnya: blok IP NVR & kamera dari WAN sepenuhnya di firewall router.
+   - Idealnya: blok IP NVR & kamera dari WAN sepenuhnya di firewall routeXr.
      NVR tidak butuh internet untuk fungsi CCTV lokal.
 4. Cek pengaturan **DDNS** dan **email** di NVR — penyerang kadang menaruh
    konfigurasi untuk akses ulang.
@@ -97,7 +97,7 @@ router mendukung, batasi akses port 5432 hanya dari segmen manajemen.
 ## 3. Whitelist segmen login
 
 Login dashboard hanya diizinkan dari CIDR yang di-whitelist
-(default: `10.10.100.0/24, 10.10.80.0/24` — dari env `ALLOWED_LOGIN_CIDRS`,
+(default: `10.10.100.0/24, 10.10.80.0/24, 127.0.0.1/32` — dari env `ALLOWED_LOGIN_CIDRS`,
 hanya seed awal; setelah itu dikelola dari tab **Users & Login**).
 Percobaan dari luar whitelist ditolak (403) dan tercatat 🚫 di riwayat.
 

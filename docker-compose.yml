@@ -101,7 +101,7 @@ services:
       - COOKIE_SECURE=${COOKIE_SECURE:-}
       # Whitelist segmen yang boleh login (seed awal; sesudahnya via UI).
       # EXTRA_LOGIN_CIDRS = pintu darurat anti-lockout (selalu di-union).
-      - ALLOWED_LOGIN_CIDRS=${ALLOWED_LOGIN_CIDRS:-10.10.100.0/24,10.10.80.0/24}
+      - ALLOWED_LOGIN_CIDRS=${ALLOWED_LOGIN_CIDRS:-10.10.100.0/24,10.10.80.0/24,127.0.0.1/32}
       - EXTRA_LOGIN_CIDRS=${EXTRA_LOGIN_CIDRS:-}
       # Interval scan keamanan NVR (akun baru + log login), detik
       - NVR_SECURITY_SCAN_SECS=${NVR_SECURITY_SCAN_SECS:-300}
