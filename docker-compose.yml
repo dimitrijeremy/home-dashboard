@@ -105,6 +105,18 @@ services:
       - EXTRA_LOGIN_CIDRS=${EXTRA_LOGIN_CIDRS:-}
       # Interval scan keamanan NVR (akun baru + log login), detik
       - NVR_SECURITY_SCAN_SECS=${NVR_SECURITY_SCAN_SECS:-300}
+      # ── Housekeeping storage volume camera_data ──────────────────────
+      # Snapshot + clip event ditulis tiap event NVR dan TIDAK pernah dibuang
+      # sendiri; janitor di backend yang menegakkan batas di bawah ini dengan
+      # membuang file tertua duluan. Turunkan MEDIA_MAX_GB = hapus permanen.
+      - MEDIA_MAX_GB=${MEDIA_MAX_GB:-40}
+      - MEDIA_RETENTION_DAYS=${MEDIA_RETENTION_DAYS:-30}
+      - MEDIA_JANITOR_SECS=${MEDIA_JANITOR_SECS:-600}
+      - EVENT_DB_MAX_ROWS=${EVENT_DB_MAX_ROWS:-50000}
+      # Rem di sisi produksi: 1 media per channel per N detik untuk kode motion
+      # generik (VideoMotion/SmartMotionHuman). Event AI/wajah tidak di-gate.
+      - NVR_EVENT_NOISY_COOLDOWN_SECS=${NVR_EVENT_NOISY_COOLDOWN_SECS:-60}
+      - NVR_EVENT_CLIP_SECS=${NVR_EVENT_CLIP_SECS:-12}
       # Postgres monitoring mirror (DBeaver) — PG_HOST kosong = mati
       - PG_HOST=pg
       - PG_PORT=5432

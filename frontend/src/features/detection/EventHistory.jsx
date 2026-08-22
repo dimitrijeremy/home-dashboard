@@ -77,6 +77,7 @@ export default function EventHistory() {
                   <th>Zona</th>
                   <th>Orang</th>
                   <th>Conf</th>
+                  <th>Foto</th>
                 </tr>
               </thead>
               <tbody>
@@ -95,6 +96,15 @@ export default function EventHistory() {
                       <td className="ev-person">{ev.person_name || <span style={{ color: 'var(--text-muted)' }}>Tidak dikenal</span>}</td>
                       <td className="ev-conf">
                         {ev.confidence != null ? `${(ev.confidence * 100).toFixed(0)}%` : '—'}
+                      </td>
+                      <td className="ev-photo">
+                        {ev.snapshot_url ? (
+                          <a href={ev.snapshot_url} target="_blank" rel="noreferrer" title="Buka foto ukuran penuh">
+                            <img className="ev-photo-thumb" src={ev.snapshot_url} alt={`Wajah terdeteksi — ${meta.label}`} loading="lazy" />
+                          </a>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)' }}>—</span>
+                        )}
                       </td>
                     </tr>
                   )

@@ -35,6 +35,17 @@ function relTime(isoStr) {
   return `${Math.floor(s / 3600)} jam lalu`
 }
 
+// Clip event dibuat asinkron setelah event masuk, dan dibuang lagi oleh janitor
+// backend saat budget storage terlampaui (lihat MONITORING.md § 5). Tanpa
+// pembeda umur, event lama yang clipnya sudah dihapus akan selamanya bilang
+// "sedang disiapkan" — padahal tidak akan pernah datang.
+const CLIP_PENDING_WINDOW_SECS = 300
+
+function clipIsStillPending(isoStr) {
+  const age = (Date.now() - new Date(isoStr).getTime()) / 1000
+  return Number.isFinite(age) && age < CLIP_PENDING_WINDOW_SECS
+}
+
 function absTime(isoStr) {
   return new Date(isoStr).toLocaleString('id-ID', {
     day: '2-digit',
@@ -223,6 +234,7 @@ export default function NVREventLog() {
   }
 
   const zonePoints = Array.isArray(previewEvent?.zone_points) ? previewEvent.zone_points : []
+  const clipPending = !previewEvent?.clip_url && clipIsStillPending(previewEvent?.ts)
   const detectionBox = previewEvent?.detection_box
   const previewCanvasWidth = `${Math.max(previewZoom * 100, 100)}%`
 
@@ -252,9 +264,17 @@ export default function NVREventLog() {
               className={`btn btn-ghost${previewMode === 'video' ? ' is-active' : ''}`}
               disabled={!previewEvent.clip_url}
               onClick={() => setPreviewMode('video')}
-              title={previewEvent.clip_url ? 'Putar clip event' : 'Clip sedang disiapkan'}
+              title={
+                previewEvent.clip_url
+                  ? 'Putar clip event'
+                  : clipPending
+                    ? 'Clip sedang disiapkan'
+                    : 'Clip tidak tersimpan untuk event ini'
+              }
             >
-              {previewEvent.clip_url ? 'Playback Event' : 'Menyiapkan Playback…'}
+              {previewEvent.clip_url
+                ? 'Playback Event'
+                : clipPending ? 'Menyiapkan Playback…' : 'Playback Tidak Ada'}
             </button>
           </div>
 
@@ -318,7 +338,9 @@ export default function NVREventLog() {
           {previewEvent.zone_name && <span>Zona: {previewEvent.zone_name}</span>}
           {previewEvent.clip_url
             ? <span>Playback clip lokal siap diputar.</span>
-            : <span>Playback clip sedang disiapkan atau belum tersedia.</span>}
+            : clipPending
+              ? <span>Playback clip sedang disiapkan…</span>
+              : <span>Clip tidak tersimpan untuk event ini — sudah dilewat cooldown capture atau dibuang housekeeping storage.</span>}
           {previewMode === 'image' && previewZoom > 1 && <span>Geser gambar dengan drag untuk melihat area lain.</span>}
         </div>
       </div>

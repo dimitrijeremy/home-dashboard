@@ -40,6 +40,7 @@ FACE_PHOTO_DIR = os.getenv("FACE_PHOTO_DIR", "/data/face_photos")
 SNAPSHOT_DIR   = os.getenv("SNAPSHOT_DIR",   "/data/snapshots")
 NVR_EVENT_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "nvr_events")
 NVR_EVENT_CLIP_DIR = os.path.join(SNAPSHOT_DIR, "nvr_event_clips")
+FACE_EVENT_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "face_events")
 MTX_RTSP_HOST = os.getenv("MTX_HOST", "mtx")
 MTX_RTSP_PORT = int(os.getenv("RTSP_PORT", "8554"))
 NVR_EVENT_CLIP_SECS = int(os.getenv("NVR_EVENT_CLIP_SECS", "12"))
@@ -54,6 +55,31 @@ NVR_EVENT_PREVIEW_CODES = {
     "FaceRecognized",
 }
 NVR_EVENT_FETCH_LIMIT = 80
+
+# ── Housekeeping media event ──────────────────────────────────────────────
+# Tiap event "Start" dari NVR menulis 1 JPEG snapshot + 1 clip MP4 selama
+# NVR_EVENT_CLIP_SECS detik dengan `-c copy` (bitrate penuh main stream).
+# Tanpa rem, volume camera_data tumbuh tanpa batas. Dua rem dipasang:
+#   1. cooldown per (channel, code) untuk kode motion yang datang beruntun,
+#      supaya satu orang lewat tidak jadi puluhan clip yang isinya sama;
+#   2. budget disk keras — file tertua dihapus sampai total <= MEDIA_MAX_GB.
+# Janitor HANYA menyentuh direktori media event di _MEDIA_DIRS. Foto wajah
+# terdaftar (FACE_PHOTO_DIR), snapshot live per-channel untuk zone editor, dan
+# cameras.db tidak pernah ikut terhapus.
+MEDIA_MAX_GB = float(os.getenv("MEDIA_MAX_GB", "40") or 0)          # 0 = tanpa batas
+MEDIA_RETENTION_DAYS = int(os.getenv("MEDIA_RETENTION_DAYS", "30") or 0)  # 0 = tanpa batas umur
+MEDIA_JANITOR_SECS = max(int(os.getenv("MEDIA_JANITOR_SECS", "600") or 600), 60)
+# Baris event lama ikut dipangkas supaya cameras.db tidak membengkak sendiri.
+EVENT_DB_MAX_ROWS = int(os.getenv("EVENT_DB_MAX_ROWS", "50000") or 0)
+# Kode motion generik — dibatasi 1 capture per channel per N detik. Event AI /
+# wajah (ZoneIntrusion, UnknownFace, FaceRecognized, CrossLine/CrossRegion)
+# sengaja TIDAK masuk sini: itu bukti kejadian, jangan sampai ada yang hilang.
+NVR_EVENT_NOISY_CODES = {"VideoMotion", "SmartMotionHuman"}
+NVR_EVENT_NOISY_COOLDOWN_SECS = int(os.getenv("NVR_EVENT_NOISY_COOLDOWN_SECS", "60") or 0)
+_MEDIA_DIRS = (NVR_EVENT_CLIP_DIR, NVR_EVENT_SNAPSHOT_DIR, FACE_EVENT_SNAPSHOT_DIR)
+_capture_cooldown = {}
+_capture_cooldown_lock = threading.Lock()
+_media_usage = {"bytes": 0, "files": 0, "oldest": None, "last_run": None}
 
 # Pilihan kualitas stream (setting global, key 'stream_quality'):
 #   source — main stream apa adanya (subtype 0, tanpa scale)
@@ -274,6 +300,29 @@ def _capture_nvr_event_snapshot(channel_number, code):
     return None
 
 
+def _save_face_event_photo(photo_b64, event_type):
+    """Simpan crop wajah yang dikirim analyzer (frame asli saat deteksi) —
+    lebih akurat & lebih cepat daripada _capture_nvr_event_snapshot yang
+    minta ulang snapshot channel penuh ke NVR setelah kejadiannya lewat."""
+    if not photo_b64:
+        return None
+    try:
+        raw = base64.b64decode(photo_b64)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    os.makedirs(FACE_EVENT_SNAPSHOT_DIR, exist_ok=True)
+    safe_code = re.sub(r"[^A-Za-z0-9_-]+", "_", event_type or "face")[:40]
+    snapshot_name = (
+        f"{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{safe_code}_{uuid4().hex[:8]}.jpg"
+    )
+    snapshot_path = os.path.join(FACE_EVENT_SNAPSHOT_DIR, snapshot_name)
+    with open(snapshot_path, "wb") as fh:
+        fh.write(raw)
+    return snapshot_path
+
+
 def _serialize_nvr_event_row(row):
     event = {
         "id": row["id"],
@@ -417,6 +466,168 @@ def _start_event_clip_capture(event_id, path_name):
         name=f"nvr-clip-{event_id}",
     ).start()
 
+def _claim_capture_slot(channel_number, code):
+    """True kalau event ini boleh menghasilkan snapshot + clip.
+
+    VideoMotion/SmartMotionHuman terus dikirim NVR selama masih ada gerakan —
+    satu kejadian bisa jadi puluhan event dalam semenit, dan tiap event berarti
+    satu clip belasan detik lagi. Gate ini membuat satu channel maksimal
+    menghasilkan 1 media per NVR_EVENT_NOISY_COOLDOWN_SECS untuk kode tersebut.
+    Event-nya sendiri tetap dicatat penuh di log, hanya medianya yang dilewat."""
+    if NVR_EVENT_NOISY_COOLDOWN_SECS <= 0 or code not in NVR_EVENT_NOISY_CODES:
+        return True
+    key = (channel_number, code)
+    now = time.monotonic()
+    with _capture_cooldown_lock:
+        if now - _capture_cooldown.get(key, 0.0) < NVR_EVENT_NOISY_COOLDOWN_SECS:
+            return False
+        _capture_cooldown[key] = now
+    return True
+
+
+def _media_inventory():
+    """(total_bytes, [(mtime, size, path), ...] urut dari yang paling lama)."""
+    total = 0
+    files = []
+    for directory in _MEDIA_DIRS:
+        try:
+            entries = os.scandir(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                total += st.st_size
+                files.append((st.st_mtime, st.st_size, entry.path))
+    files.sort(key=lambda item: item[0])
+    return total, files
+
+
+def _forget_missing_media():
+    """Kosongkan kolom path yang filenya sudah tidak ada, supaya UI tidak
+    menampilkan thumbnail / tombol playback yang sudah pasti 404.
+
+    Dicocokkan lewat os.path.exists, bukan lewat daftar path yang barusan
+    dihapus: satu kali scan per tabel (UPDATE-nya lewat primary key), dan
+    sekalian membereskan file yang hilang karena dihapus manual di server."""
+    con = _db_connect()
+    try:
+        for table, cols in (("nvr_events", ("snapshot_path", "clip_path")),
+                            ("detection_events", ("snapshot_path",))):
+            for col in cols:
+                stale = [
+                    (row["id"],)
+                    for row in con.execute(
+                        f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL")
+                    if not os.path.exists(row[col])
+                ]
+                if stale:
+                    con.executemany(f"UPDATE {table} SET {col}=NULL WHERE id=?", stale)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _trim_event_rows():
+    """Buang baris event tertua beserta filenya kalau tabel melewati
+    EVENT_DB_MAX_ROWS."""
+    if EVENT_DB_MAX_ROWS <= 0:
+        return 0
+    removed = 0
+    con = _db_connect()
+    try:
+        for table, cols in (("nvr_events", ("snapshot_path", "clip_path")),
+                            ("detection_events", ("snapshot_path",))):
+            excess = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] - EVENT_DB_MAX_ROWS
+            if excess <= 0:
+                continue
+            rows = con.execute(
+                f"SELECT id, {', '.join(cols)} FROM {table} ORDER BY id ASC LIMIT ?", (excess,)
+            ).fetchall()
+            if not rows:
+                continue
+            for row in rows:
+                for col in cols:
+                    path = row[col]
+                    if not path:
+                        continue
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            con.execute(f"DELETE FROM {table} WHERE id <= ?", (rows[-1]["id"],))
+            removed += len(rows)
+        con.commit()
+    finally:
+        con.close()
+    return removed
+
+
+def _media_janitor_cycle():
+    trimmed_rows = _trim_event_rows()
+    total, files = _media_inventory()
+    budget = int(MEDIA_MAX_GB * 1024 ** 3) if MEDIA_MAX_GB > 0 else 0
+    cutoff = (time.time() - MEDIA_RETENTION_DAYS * 86400) if MEDIA_RETENTION_DAYS > 0 else None
+
+    deleted, freed = [], 0
+    for mtime, size, path in files:  # sudah urut: yang paling lama dibuang duluan
+        too_old = cutoff is not None and mtime < cutoff
+        over_budget = budget > 0 and (total - freed) > budget
+        if not too_old and not over_budget:
+            break  # sisanya lebih baru dan sudah muat di budget
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        freed += size
+        deleted.append(path)
+
+    if deleted:
+        _forget_missing_media()
+
+    dropped = set(deleted)
+    remaining = [item for item in files if item[2] not in dropped]
+    _media_usage.update({
+        "bytes": total - freed,
+        "files": len(remaining),
+        "budget_bytes": budget,
+        "retention_days": MEDIA_RETENTION_DAYS,
+        "oldest": (datetime.utcfromtimestamp(remaining[0][0]).strftime("%Y-%m-%dT%H:%M:%SZ")
+                   if remaining else None),
+        "last_run": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "deleted_last": len(deleted),
+        "freed_last": freed,
+        "rows_trimmed_last": trimmed_rows,
+    })
+
+    if deleted or trimmed_rows:
+        print(f"[JANITOR] hapus {len(deleted)} file ({freed / 1024 ** 3:.2f} GB), "
+              f"pangkas {trimmed_rows} baris event — sisa "
+              f"{(total - freed) / 1024 ** 3:.2f} GB / {MEDIA_MAX_GB:g} GB", flush=True)
+        with _nvr_lock:
+            _nvr_bump_locked()
+
+
+def _media_janitor_worker():
+    time.sleep(30)
+    last_error = None
+    while True:
+        try:
+            _media_janitor_cycle()
+            last_error = None
+        except Exception as e:
+            msg = str(e)[:150]
+            if msg != last_error:
+                print(f"[JANITOR] gagal: {msg}", flush=True)
+                last_error = msg
+        time.sleep(MEDIA_JANITOR_SECS)
+
+
 # ── DB helpers ──────────────────────────────────────────────
 
 def get_db():
@@ -450,6 +661,8 @@ def ensure_detection_columns(con):
     existing = {row[1] for row in con.execute("PRAGMA table_info(detection_events)")}
     if "alarm_triggered" not in existing:
         con.execute("ALTER TABLE detection_events ADD COLUMN alarm_triggered INTEGER NOT NULL DEFAULT 0")
+    if "snapshot_path" not in existing:
+        con.execute("ALTER TABLE detection_events ADD COLUMN snapshot_path TEXT")
 
 
 def ensure_nvr_event_columns(con):
@@ -1716,13 +1929,19 @@ def _nvr_event_worker():
                             "source": "nvr",
                             "path_name": f"ch{channel_number}" if channel_number else None,
                         }
+                        # Event tetap dicatat semua; yang di-gate cuma medianya
+                        # (lihat _claim_capture_slot).
+                        capture_media = (
+                            _should_capture_event_snapshot(ev_code, ev_action)
+                            and _claim_capture_slot(channel_number, ev_code)
+                        )
                         snapshot_path = None
-                        if _should_capture_event_snapshot(ev_code, ev_action):
+                        if capture_media:
                             snapshot_path = _capture_nvr_event_snapshot(channel_number, ev_code)
                         event["id"] = _store_nvr_event(event, snapshot_path=snapshot_path)
                         if snapshot_path:
                             event["snapshot_url"] = f"/api/nvr-events/{event['id']}/snapshot"
-                        if _should_capture_event_snapshot(ev_code, ev_action):
+                        if capture_media:
                             _start_event_clip_capture(event["id"], event.get("path_name"))
                         with _nvr_lock:
                             _nvr_events.appendleft(event)
@@ -2218,10 +2437,14 @@ def receive_analyzer_event():
     event_type   = body.get('event_type', 'Unknown')
     alarm        = 1 if (current_mode == 'away' and event_type in ALARM_EVENT_TYPES) else 0
 
+    # Crop wajah dari frame asli saat deteksi (dikirim analyzer untuk
+    # FaceRecognized/UnknownFace) — lihat _save_face_event_photo.
+    face_snapshot_path = _save_face_event_photo(body.get('face_photo_b64'), event_type)
+
     db.execute(
         """INSERT INTO detection_events
-           (ts, channel_id, camera_name, event_type, zone_name, person_name, confidence, extra_json, alarm_triggered)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+           (ts, channel_id, camera_name, event_type, zone_name, person_name, confidence, extra_json, alarm_triggered, snapshot_path)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (
             ts,
             body.get('channel_id', ''),
@@ -2232,6 +2455,7 @@ def receive_analyzer_event():
             body.get('confidence'),
             body.get('extra_json'),
             alarm,
+            face_snapshot_path,
         )
     )
     db.commit()
@@ -2257,8 +2481,10 @@ def receive_analyzer_event():
         event.update(extra_payload)
     if event['channel_number']:
         event['index'] = max(event['channel_number'] - 1, 0)
-    snapshot_path = None
-    if _should_capture_event_snapshot(event_type, 'Start'):
+    # Kalau analyzer sudah kirim crop wajah, pakai itu — hindari re-fetch
+    # snapshot channel penuh ke NVR yang lebih lambat dan kurang presisi.
+    snapshot_path = face_snapshot_path
+    if not snapshot_path and _should_capture_event_snapshot(event_type, 'Start'):
         snapshot_path = _capture_nvr_event_snapshot(event['channel_number'], event_type)
     event['id'] = _store_nvr_event(event, snapshot_path=snapshot_path)
     if snapshot_path:
@@ -2278,12 +2504,28 @@ def get_detection_events():
     offset = int(request.args.get('offset', 0))
     rows = get_db().execute(
         """SELECT id, ts, channel_id, camera_name, event_type, zone_name,
-                  person_name, confidence
+                  person_name, confidence, snapshot_path
            FROM detection_events ORDER BY id DESC LIMIT ? OFFSET ?""",
         (limit, offset)
     ).fetchall()
     total = get_db().execute("SELECT COUNT(*) FROM detection_events").fetchone()[0]
-    return jsonify({'total': total, 'events': [dict(r) for r in rows]})
+    events = []
+    for row in rows:
+        ev = dict(row)
+        if ev.pop('snapshot_path', None):
+            ev['snapshot_url'] = f"/api/detection-events/{ev['id']}/snapshot"
+        events.append(ev)
+    return jsonify({'total': total, 'events': events})
+
+
+@app.route('/api/detection-events/<int:event_id>/snapshot', methods=['GET'])
+def get_detection_event_snapshot(event_id):
+    row = get_db().execute("SELECT snapshot_path FROM detection_events WHERE id=?", (event_id,)).fetchone()
+    if not row or not row['snapshot_path'] or not os.path.exists(row['snapshot_path']):
+        return jsonify({'error': 'snapshot not found'}), 404
+    with open(row['snapshot_path'], 'rb') as fh:
+        data = fh.read()
+    return data, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=300'}
 
 
 @app.route('/api/detection-events', methods=['DELETE'])
@@ -2457,6 +2699,54 @@ def get_nvr_event_clip(event_id):
     return send_file(row['clip_path'], mimetype='video/mp4', conditional=True, max_age=300)
 
 
+@app.route('/api/storage', methods=['GET'])
+def get_storage_usage():
+    """Rincian pemakaian disk media event + status janitor terakhir.
+    Dipakai untuk memverifikasi budget MEDIA_MAX_GB benar-benar ditegakkan."""
+    dirs = {}
+    for directory in _MEDIA_DIRS:
+        size = count = 0
+        try:
+            entries = os.scandir(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            entries = None
+        if entries is not None:
+            with entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            size += entry.stat(follow_symlinks=False).st_size
+                            count += 1
+                    except OSError:
+                        pass
+        dirs[os.path.basename(directory)] = {'bytes': size, 'files': count}
+
+    try:
+        db_bytes = os.path.getsize(DB_PATH)
+    except OSError:
+        db_bytes = 0
+    try:
+        disk = shutil.disk_usage(_DATA_DIR)
+        disk_info = {'total': disk.total, 'used': disk.used, 'free': disk.free}
+    except OSError:
+        disk_info = None
+
+    managed = sum(d['bytes'] for d in dirs.values())
+    return jsonify({
+        'dirs': dirs,
+        'managed_bytes': managed,
+        'db_bytes': db_bytes,
+        'budget_bytes': int(MEDIA_MAX_GB * 1024 ** 3) if MEDIA_MAX_GB > 0 else 0,
+        'budget_gb': MEDIA_MAX_GB,
+        'retention_days': MEDIA_RETENTION_DAYS,
+        'clip_secs': NVR_EVENT_CLIP_SECS,
+        'noisy_cooldown_secs': NVR_EVENT_NOISY_COOLDOWN_SECS,
+        'event_db_max_rows': EVENT_DB_MAX_ROWS,
+        'disk': disk_info,
+        'janitor': dict(_media_usage),
+    })
+
+
 # ── Postgres monitoring mirror ───────────────────────────────────────────────
 # DB terpisah untuk analisa/audit dari luar (DBeaver): backend menyalin tabel
 # monitoring dari SQLite ke Postgres secara periodik (satu arah, incremental).
@@ -2558,6 +2848,8 @@ threading.Thread(target=_nvr_security_worker, daemon=True, name="nvr-security").
 
 if PG_HOST:
     threading.Thread(target=_pg_sync_worker, daemon=True, name="pg-sync").start()
+
+threading.Thread(target=_media_janitor_worker, daemon=True, name="media-janitor").start()
 
 init_db()
 

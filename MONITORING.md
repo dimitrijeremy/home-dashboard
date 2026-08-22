@@ -149,3 +149,85 @@ ini login lewat `http://...:8088` tidak akan bisa — pakai selalu `:8443`.)
 Alternatif kalau punya domain publik + akses API DNS (Cloudflare dll):
 Let's Encrypt DNS-01 via Caddy — nol install profile di perangkat dan
 perpanjangan full otomatis. Kabari kalau mau jalur ini.
+
+---
+
+## 5. Housekeeping storage (volume `camera_data`)
+
+### Kenapa bisa membengkak
+
+Volume `camera_data` menampung tiga hal dengan sifat berbeda:
+
+| Isi | Lokasi | Sifat |
+|---|---|---|
+| `cameras.db` | `/data/cameras.db` | tumbuh pelan (teks) |
+| Foto wajah terdaftar | `/data/face_photos/` | kecil, dikelola manual dari UI |
+| Snapshot live per channel | `/data/snapshots/chN.jpg` | ditimpa terus, ukuran tetap |
+| **Media event** | `/data/snapshots/nvr_events/`, `nvr_event_clips/`, `face_events/` | **tumbuh tanpa batas** |
+
+Biang keroknya baris terakhir. Setiap event NVR ber-`action=Start` dengan code
+di `NVR_EVENT_PREVIEW_CODES` memicu dua tulisan sekaligus:
+
+1. `_capture_nvr_event_snapshot()` — 1 JPEG resolusi penuh dari NVR;
+2. `_capture_nvr_event_clip()` — 1 MP4 sepanjang `NVR_EVENT_CLIP_SECS` (12 detik)
+   yang diambil `-c copy` dari main stream, jadi **bitrate penuh**. Pada 4 Mbps
+   itu ±6 MB per clip.
+
+`VideoMotion` ikut di daftar itu, dan NVR mengirimnya berulang selama masih ada
+gerakan — satu orang lewat depan kamera gampang jadi belasan event, belasan
+clip, isinya nyaris sama.
+
+### Rem yang dipasang
+
+Dua-duanya di `backend/app.py`, semua lewat env di `docker-compose.yml`:
+
+**Rem produksi** — `NVR_EVENT_NOISY_COOLDOWN_SECS` (default 60).
+`_claim_capture_slot()` membatasi `VideoMotion`/`SmartMotionHuman` jadi maksimal
+1 media per channel per 60 detik. Event-nya **tetap tercatat lengkap** di log dan
+di DB; yang dilewat hanya snapshot + clip-nya. Event AI dan wajah
+(`ZoneIntrusion`, `UnknownFace`, `FaceRecognized`, `CrossLine/CrossRegion`)
+sengaja **tidak** kena cooldown — itu bukti kejadian.
+
+**Rem penghapusan** — thread `media-janitor`, jalan tiap `MEDIA_JANITOR_SECS`
+(default 600 detik). Urutan kerjanya:
+
+1. pangkas baris `nvr_events`/`detection_events` di atas `EVENT_DB_MAX_ROWS`
+   berikut filenya;
+2. hapus file event lebih tua dari `MEDIA_RETENTION_DAYS`;
+3. hapus file **tertua duluan** sampai total ≤ `MEDIA_MAX_GB`;
+4. NULL-kan kolom `snapshot_path`/`clip_path` yang filenya sudah hilang, supaya
+   UI tidak menampilkan thumbnail dan tombol playback yang pasti 404.
+
+Janitor **hanya** menyentuh tiga direktori media event. `face_photos/`,
+`snapshots/chN.jpg`, dan `cameras.db` tidak pernah ikut terhapus.
+
+### Setelan
+
+```bash
+MEDIA_MAX_GB=40                    # 0 = tanpa batas (perilaku lama)
+MEDIA_RETENTION_DAYS=30            # 0 = tanpa batas umur
+MEDIA_JANITOR_SECS=600
+EVENT_DB_MAX_ROWS=50000
+NVR_EVENT_NOISY_COOLDOWN_SECS=60   # 0 = capture semua (perilaku lama)
+NVR_EVENT_CLIP_SECS=12             # pengali langsung ukuran per clip
+```
+
+> **PERINGATAN:** menurunkan `MEDIA_MAX_GB` langsung menghapus file lama secara
+> permanen pada siklus janitor berikutnya. Backup dulu kalau ada clip yang masih
+> dibutuhkan.
+
+### Cek kondisi
+
+```bash
+# Rincian per direktori + status janitor terakhir (butuh sesi login)
+curl -sk https://<server-ip>:8443/api/storage | jq
+
+# Dari sisi host
+docker compose exec backend du -sh /data/* /data/snapshots/*
+docker compose logs backend | grep JANITOR
+```
+
+Kalau volume masih membesar setelah janitor jalan, lever berikutnya berurutan
+dari yang paling besar dampaknya: keluarkan `VideoMotion` dari
+`NVR_EVENT_PREVIEW_CODES`, turunkan `NVR_EVENT_CLIP_SECS`, atau ambil clip dari
+substream (`stream_quality=sub`) supaya bitrate-nya jauh lebih kecil.

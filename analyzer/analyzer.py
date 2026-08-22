@@ -114,19 +114,24 @@ def _cooling(channel_id: str, key: str) -> bool:
 
 
 def _post_event(channel_id: str, camera_name: str, event_type: str,
-                zone_name=None, person_name=None, confidence=None, extra_json=None):
+                zone_name=None, person_name=None, confidence=None, extra_json=None,
+                face_photo: bytes | None = None):
+    payload = {
+        "channel_id":  channel_id,
+        "camera_name": camera_name,
+        "event_type":  event_type,
+        "zone_name":   zone_name,
+        "person_name": person_name,
+        "confidence":  round(confidence, 3) if confidence else None,
+        "extra_json":  json.dumps(extra_json) if extra_json else None,
+    }
+    if face_photo:
+        import base64
+        payload["face_photo_b64"] = base64.b64encode(face_photo).decode("ascii")
     try:
         requests.post(
             f"{BACKEND_URL}/api/analyzer-event",
-            json={
-                "channel_id":  channel_id,
-                "camera_name": camera_name,
-                "event_type":  event_type,
-                "zone_name":   zone_name,
-                "person_name": person_name,
-                "confidence":  round(confidence, 3) if confidence else None,
-                "extra_json":  json.dumps(extra_json) if extra_json else None,
-            },
+            json=payload,
             headers=_backend_headers(),
             timeout=4,
         )
@@ -134,21 +139,37 @@ def _post_event(channel_id: str, camera_name: str, event_type: str,
         log.warning(f"post_event failed: {e}")
 
 
-def _extract_face_embedding(frame_bgr: np.ndarray, x1, y1, x2, y2) -> np.ndarray | None:
-    """Crop person bounding box and return the first detected face embedding."""
+def _crop_face_jpeg(person_crop: np.ndarray, face_bbox) -> bytes | None:
+    """Tight JPEG crop of just the face (with a little padding) for event photos."""
+    ph, pw = person_crop.shape[:2]
+    fx1, fy1, fx2, fy2 = [int(v) for v in face_bbox]
+    pad = int(max(fx2 - fx1, fy2 - fy1, 1) * 0.3)
+    fx1, fy1 = max(0, fx1 - pad), max(0, fy1 - pad)
+    fx2, fy2 = min(pw, fx2 + pad), min(ph, fy2 + pad)
+    face_crop = person_crop[fy1:fy2, fx1:fx2]
+    if face_crop.size == 0:
+        return None
+    ok, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes() if ok else None
+
+
+def _extract_face_embedding(frame_bgr: np.ndarray, x1, y1, x2, y2):
+    """Crop person bounding box and return (embedding, face_jpeg_bytes) for the
+    first detected face — both None if no face is found."""
     h, w = frame_bgr.shape[:2]
     crop = frame_bgr[max(0, y1 - 10):min(h, y2 + 10),
                      max(0, x1 - 10):min(w, x2 + 10)]
     if crop.size == 0:
-        return None
+        return None, None
     try:
         faces = face_app.get(crop)
         if not faces:
-            return None
-        return faces[0].normed_embedding
+            return None, None
+        face = faces[0]
+        return face.normed_embedding, _crop_face_jpeg(crop, face.bbox)
     except Exception as e:
         log.debug(f"extract_face_embedding: {e}")
-        return None
+        return None, None
 
 
 def _match_face_embedding(embedding: np.ndarray) -> tuple[str | None, float]:
@@ -163,17 +184,18 @@ def _match_face_embedding(embedding: np.ndarray) -> tuple[str | None, float]:
     return None, best_sim
 
 
-def _identify_person(frame_bgr: np.ndarray, x1, y1, x2, y2) -> tuple[bool, str | None, float]:
-    """Run face detection on a person crop and optionally match against enrolled faces."""
-    embedding = _extract_face_embedding(frame_bgr, x1, y1, x2, y2)
+def _identify_person(frame_bgr: np.ndarray, x1, y1, x2, y2):
+    """Run face detection on a person crop and optionally match against enrolled
+    faces. Returns (face_found, person_name, confidence, face_jpeg_bytes)."""
+    embedding, face_photo = _extract_face_embedding(frame_bgr, x1, y1, x2, y2)
     if embedding is None:
-        return False, None, 0.0
+        return False, None, 0.0, None
     with face_db_lock:
         has_face_db = len(face_db) > 0
     if not has_face_db:
-        return True, None, 0.0
+        return True, None, 0.0, face_photo
     name, similarity = _match_face_embedding(embedding)
-    return True, name, similarity
+    return True, name, similarity, face_photo
 
 
 def _unknown_face_cooldown_key(channel_id: str, cx_norm: float, cy_norm: float) -> str:
@@ -182,20 +204,21 @@ def _unknown_face_cooldown_key(channel_id: str, cx_norm: float, cy_norm: float) 
 
 def _emit_face_event(channel_id: str, camera_name: str, event_extra: dict,
                      cx_norm: float, cy_norm: float, face_found: bool,
-                     person_name: str | None, face_conf: float):
+                     person_name: str | None, face_conf: float,
+                     face_photo: bytes | None = None):
     if not face_found:
         return
     if person_name and not _cooling(channel_id, f"face_known_{person_name}"):
         log.info(f"[{channel_id}] FaceRecognized: {person_name} ({face_conf:.2f})")
         _post_event(channel_id, camera_name, "FaceRecognized",
                     person_name=person_name, confidence=face_conf,
-                    extra_json=event_extra)
+                    extra_json=event_extra, face_photo=face_photo)
         return
     if not person_name and not _cooling(channel_id, _unknown_face_cooldown_key(channel_id, cx_norm, cy_norm)):
         log.info(f"[{channel_id}] UnknownFace sim={face_conf:.2f}")
         _post_event(channel_id, camera_name, "UnknownFace",
                     confidence=face_conf,
-                    extra_json=event_extra)
+                    extra_json=event_extra, face_photo=face_photo)
 
 
 # ── DB Refresh ────────────────────────────────────────────────────────────────
@@ -308,9 +331,9 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
             "frame_size": {"width": w, "height": h},
         }
         if run_face:
-            face_found, person_name, face_conf = _identify_person(frame, x1, y1, x2, y2)
+            face_found, person_name, face_conf, face_photo = _identify_person(frame, x1, y1, x2, y2)
         else:
-            face_found, person_name, face_conf = False, None, 0.0
+            face_found, person_name, face_conf, face_photo = False, None, 0.0, None
         if face_found:
             event_extra["face_detected"] = True
 
@@ -344,6 +367,7 @@ def process_frame(camera_id: int, camera_name: str, channel_id: str,
             face_found,
             person_name,
             face_conf,
+            face_photo,
         )
 
 

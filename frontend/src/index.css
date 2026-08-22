@@ -373,6 +373,7 @@ body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-s
 .ev-face-unk .ev-type-badge,.ev-type-badge.ev-face-unk{background:rgba(239,68,68,.12);color:#ef4444}
 .ev-person{font-size:.78rem}
 .ev-conf{font-size:.75rem;color:var(--text-muted);font-variant-numeric:tabular-nums}
+.ev-photo-thumb{width:36px;height:36px;object-fit:cover;border-radius:var(--r-sm);border:1px solid var(--border);display:block}
 .ev-hist-pagination{display:flex;align-items:center;justify-content:center;gap:12px}
 .ev-page-info{font-size:.78rem;color:var(--text-muted)}
 .btn-red{background:rgba(239,68,68,.12);color:#ef4444;border:1px solid rgba(239,68,68,.3);border-radius:var(--r-sm);padding:5px 12px;font-size:.8rem;cursor:pointer;transition:background var(--t)}
